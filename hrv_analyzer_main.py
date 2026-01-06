@@ -68,8 +68,7 @@ def parse_garmin_file(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
         
-        # Mapping dinamico delle colonne (basato sul file che hai caricato)
-        # Cerchiamo la colonna data che spesso ha nomi strani come 'Punteggio sonno 7 giorni'
+        # Mapping dinamico delle colonne
         date_col = df.columns[0] 
         
         df = df.rename(columns={
@@ -79,11 +78,9 @@ def parse_garmin_file(uploaded_file):
             'Qualità': 'Sleep_Quality'
         })
         
-        # Pulizia Data
         df['Date'] = pd.to_datetime(df['Date'])
         
-        # Pulizia Durata (da "7h 53min" a float 7.88 o stringa pulita)
-        # Per ora manteniamo la stringa per visualizzazione, o estraiamo le ore se serve per calcoli
+        # Pulizia Durata (da "7h 53min" a float 7.88)
         def clean_duration(val):
             if pd.isna(val): return 0
             val = str(val).lower().replace('h', '').replace('min', '')
@@ -96,7 +93,7 @@ def parse_garmin_file(uploaded_file):
             
         df['Sleep_Hours'] = df['Sleep_Duration'].apply(clean_duration)
         
-        # Mappa Qualità in voto numerico (opzionale, utile per i grafici)
+        # Mappa Qualità in voto numerico
         quality_map = {'Eccellente': 9, 'Buono': 8, 'Discreto': 6, 'Scarso': 4}
         df['Feel_Score'] = df['Sleep_Quality'].map(quality_map).fillna(5)
         
@@ -133,12 +130,6 @@ def get_traffic_light(rmssd, rhr, sleep, feel, df_history):
 
 # --- PROCESSO DI MERGE (CORE LOGIC) ---
 def process_data_integration(hrv_files, garmin_file):
-    """
-    1. Legge HRV
-    2. Legge Garmin
-    3. Unisce (Merge) su Data
-    4. Aggiorna DB
-    """
     st.write("⏳ Elaborazione in corso...")
     
     # A. Elaborazione HRV
@@ -148,10 +139,9 @@ def process_data_integration(hrv_files, garmin_file):
         if dt:
             rmssd, rhr = parse_rr_file(f.getvalue())
             if rmssd:
-                # Normalizziamo la data al giorno (senza ore) per il merge con Garmin
                 hrv_data.append({
-                    'Date': dt,             # Data precisa (timestamp)
-                    'Date_Day': dt.date(),  # Data giorno (key per merge)
+                    'Date': dt,
+                    'Date_Day': dt.date(),
                     'rMSSD': rmssd, 
                     'RHR': rhr
                 })
@@ -161,50 +151,35 @@ def process_data_integration(hrv_files, garmin_file):
         st.warning("Nessun dato HRV valido trovato.")
         return load_db()
 
-    # B. Elaborazione Garmin (se presente)
+    # B. Elaborazione Garmin
     df_garmin = pd.DataFrame()
     if garmin_file:
         df_garmin = parse_garmin_file(garmin_file)
         if not df_garmin.empty:
-            df_garmin['Date_Day'] = df_garmin['Date'].dt.date # Key per merge
+            df_garmin['Date_Day'] = df_garmin['Date'].dt.date 
             
-    # C. Unione (Left Join su HRV perché è il driver principale)
-    # Se c'è Garmin, uniamo. Altrimenti usiamo default.
+    # C. Unione
     final_rows = []
-    
-    # Ordiniamo per data
     df_hrv = df_hrv.sort_values(by='Date')
-    
-    # Carichiamo storico attuale per calcolo status
     df_current = load_db()
     temp_history = df_current.copy()
 
     for _, row in df_hrv.iterrows():
-        # Dati HRV base
         entry = {
             'Date': row['Date'],
             'rMSSD': row['rMSSD'],
             'RHR': row['RHR'],
-            'Sleep': 7.5, # Default
-            'Feel': 7,    # Default
+            'Sleep': 7.5, 
+            'Feel': 7,    
             'Status': 'Calcolo...'
         }
         
-        # Cerca corrispondenza Garmin
         if not df_garmin.empty:
-            # Filtriamo per giorno corrispondente
             match = df_garmin[df_garmin['Date_Day'] == row['Date_Day']]
             if not match.empty:
-                # Trovato! Sovrascriviamo i default
                 garmin_row = match.iloc[0]
                 entry['Sleep'] = garmin_row['Sleep_Hours']
                 entry['Feel'] = garmin_row['Feel_Score']
-                # Opzionale: puoi salvare anche Sleep_Start se aggiungi la colonna al DB
-        
-        # Calcolo Status (Logica progressiva)
-        # Evitiamo duplicati esatti nel temp_history prima del calcolo
-        if not temp_history.empty and row['Date'] in temp_history['Date'].values:
-             pass # Se esiste già, ricalcoliamo o saltiamo? Per ora calcoliamo per la nuova entry
         
         status = get_traffic_light(
             entry['rMSSD'], entry['RHR'], entry['Sleep'], entry['Feel'], temp_history
@@ -212,16 +187,12 @@ def process_data_integration(hrv_files, garmin_file):
         entry['Status'] = status
         
         final_rows.append(entry)
-        
-        # Aggiorna storico temporaneo per il prossimo loop
         temp_history = pd.concat([temp_history, pd.DataFrame([entry])], ignore_index=True)
 
     # D. Salvataggio
     if final_rows:
         df_new = pd.DataFrame(final_rows)
-        # Concatenazione col vecchio DB
         df_updated = pd.concat([df_current, df_new], ignore_index=True)
-        # Rimozione duplicati (tieni l'ultimo caricato)
         df_updated = df_updated.drop_duplicates(subset=['Date'], keep='last')
         df_updated = df_updated.sort_values(by='Date')
         
@@ -245,9 +216,8 @@ with st.sidebar:
     st.markdown("---")
     
     st.header("⌚ 2. Carica Garmin")
-    st.caption("Opzionale: Se carichi questo file, sonno e sensazioni verranno presi da qui automaticamente.")
     garmin_file = st.file_uploader(
-        "File 'Riposo.csv' esportato da Garmin",
+        "File 'Riposo.csv' Garmin",
         type=['csv'],
         key="garmin_uploader"
     )
@@ -264,7 +234,7 @@ with st.sidebar:
 df = load_db()
 
 if not df.empty:
-    # Mostra l'ultima lettura in grande (KPI)
+    # KPI
     last_entry = df.iloc[-1]
     
     st.subheader(f"📅 Ultimo Dato: {last_entry['Date'].strftime('%d/%m/%Y %H:%M')}")
@@ -285,15 +255,33 @@ if not df.empty:
 
     st.divider()
 
-    # --- GRAFICI DEI TREND ---
+    # --- GRAFICI DEI TREND (CORRETTO) ---
     st.subheader("📈 Analisi Storica")
     
-    tab1, tab2 = st.tabs(["Fisiologia (rMSSD & RHR)", "Database Completo"])
+    # Creiamo 3 TAB ora invece di 2
+    tab1, tab2, tab3 = st.tabs(["Fisiologia (rMSSD & RHR)", "Sonno & Recupero", "Database Completo"])
     
+    # TAB 1: Fisiologia
     with tab1:
+        st.caption("Andamento HRV e Battiti a Riposo")
         st.line_chart(df.set_index('Date')[['rMSSD', 'RHR']], color=["#0000FF", "#FF0000"])
     
+    # TAB 2: Sonno & Recupero (AGGIUNTO)
     with tab2:
+        col_graph1, col_graph2 = st.columns(2)
+        
+        with col_graph1:
+            st.markdown("##### 🌙 Durata Sonno (ore)")
+            # Usa bar_chart per evidenziare le ore
+            st.bar_chart(df.set_index('Date')['Sleep'], color="#6A0DAD") 
+            
+        with col_graph2:
+            st.markdown("##### ⚡ Sensazione al Risveglio (1-10)")
+            # Usa line_chart per il trend
+            st.line_chart(df.set_index('Date')['Feel'], color="#FFA500")
+
+    # TAB 3: Dati
+    with tab3:
         st.dataframe(df.sort_values('Date', ascending=False))
 
 else:
