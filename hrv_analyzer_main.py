@@ -87,7 +87,7 @@ def parse_garmin_activities(uploaded_file):
         df['Dist_km'] = df['Distanza'].apply(clean_num)
         df['Hour'] = df['Data'].dt.hour
 
-        # Categorizzazione (IMPORTANTE PER I COLORI)
+        # Categorizzazione
         def get_category(s):
             s = s.lower()
             if 'corsa' in s: return 'Load_Corsa'
@@ -271,26 +271,49 @@ df = load_db()
 if not df.empty:
     df = df.sort_values('Date')
     df['rMSSD_7d'] = df['rMSSD'].rolling(window=7, min_periods=1).mean()
+    
+    # --- CALCOLO MODALITÀ "RESPONSE" ---
+    # Shift indietro di 1 giorno: l'HRV di domani viene visualizzato sulla riga di oggi
+    df['rMSSD_Response'] = df['rMSSD'].shift(-1)
+    
     last = df.iloc[-1]
     
     st.subheader(f"📊 Report: {last['Date'].strftime('%d/%m/%Y')}")
     
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("rMSSD", f"{last['rMSSD']} ms", f"{last['rMSSD'] - last['rMSSD_7d']:.1f} vs Avg")
-    k2.metric("Load Totale", int(last['Daily_Load']) if pd.notna(last['Daily_Load']) else "--")
-    k3.metric("Sonno", f"{last['Sleep']} h")
+    k1.metric("rMSSD (Oggi)", f"{last['rMSSD']} ms", f"{last['rMSSD'] - last['rMSSD_7d']:.1f} vs Avg")
+    k2.metric("Load (Oggi)", int(last['Daily_Load']) if pd.notna(last['Daily_Load']) else "--")
+    k3.metric("Sonno (Stanotte)", f"{last['Sleep']} h")
     k4.metric("Status", last['Status'])
 
     st.divider()
 
+    # --- SELETTORE MODALITÀ GRAFICO ---
+    col_mode, col_info = st.columns([1, 3])
+    with col_mode:
+        view_mode = st.radio(
+            "Interpretazione Dati:",
+            ["🔋 Readiness (Stesso Giorno)", "📉 Response (Causa-Effetto)"],
+            index=0
+        )
+    
+    with col_info:
+        if view_mode == "🔋 Readiness (Stesso Giorno)":
+            st.info("Visualizzi: HRV di stamattina vs Allenamento di oggi pomeriggio. \n\n**Domanda:** 'Sono abbastanza riposato per sostenere il carico previsto oggi?'")
+            y_axis_hrv = 'rMSSD'
+            color_hrv = 'black'
+        else:
+            st.info("Visualizzi: Allenamento di oggi vs HRV di domani mattina. \n\n**Domanda:** 'Quanto stress ha causato l'allenamento di oggi sul mio corpo domani?' (La linea HRV è spostata indietro di 1 giorno).")
+            y_axis_hrv = 'rMSSD_Response'
+            color_hrv = '#d62728' # Rosso scuro per indicare "effetto"
+
     # --- IL SUPER GRAFICO ---
-    st.markdown("### 🧩 Quadro Completo (Carico + HRV + Sonno)")
     
     # Preparazione Dati per Altair
     chart_data = df.copy()
     chart_data = chart_data.rename(columns={'Load_Corsa': 'Corsa', 'Load_Bici': 'Bici', 'Load_Altro': 'Altro'})
     
-    # 1. GRAFICO SUPERIORE: Carico (Barre Stacked) + HRV (Linea)
+    # 1. GRAFICO SUPERIORE: Carico vs HRV (Selezionato)
     base = alt.Chart(chart_data).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title='')))
 
     # Barre Stacked (Load)
@@ -311,16 +334,17 @@ if not df.empty:
         tooltip=['Date:T', 'Sport', 'Load']
     )
 
-    # Linea HRV (Asse Destro)
-    line_hrv = base.mark_line(color='black', strokeWidth=3).encode(
-        y=alt.Y('rMSSD:Q', title='rMSSD (ms)', scale=alt.Scale(zero=False)),
-        tooltip=['Date', 'rMSSD']
+    # Linea HRV (Dinamica base al selettore)
+    line_hrv = base.mark_line(color=color_hrv, strokeWidth=3, point=True).encode(
+        y=alt.Y(f'{y_axis_hrv}:Q', title='rMSSD (ms)', scale=alt.Scale(zero=False)),
+        tooltip=['Date', f'{y_axis_hrv}']
     )
     
-    # Combinazione (Dual Axis)
     upper_chart = alt.layer(bars, line_hrv).resolve_scale(y='independent').properties(height=350)
 
     # 2. GRAFICO INFERIORE: Sonno (Barre) + Feel (Linea)
+    # Nota: Anche il sonno ha una logica temporale. Solitamente "Sonno data X" è la notte tra X-1 e X.
+    # Quindi è corretto mantenerlo allineato alla "Readiness" (HRV mattutino).
     bars_sleep = base.mark_bar(color='#2ca02c', opacity=0.5).encode(
         y=alt.Y('Sleep:Q', title='Ore Sonno', scale=alt.Scale(domain=[4, 12])),
         tooltip=['Date', 'Sleep']
