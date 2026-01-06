@@ -2,21 +2,20 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(page_title="HRV Engineer Dashboard", layout="wide", page_icon="🫀")
 
 # Titolo e Header
 st.title("🫀 HRV Engineer Dashboard")
-st.markdown("### Monitoraggio Ingegneristico - Comandi Separati")
+st.markdown("### Monitoraggio Ingegneristico: Carico vs Recupero")
 
 # --- NOME DEL DATABASE ---
 DB_FILE = 'hrv_database.csv'
 
 # --- 1. PARSING FILE HRV (RAW TXT) ---
 def parse_rr_file(file_content):
-    """Legge il contenuto raw del file TXT con gli intervalli RR."""
     try:
         content = file_content.decode("utf-8").splitlines()
         rr_intervals = []
@@ -24,47 +23,36 @@ def parse_rr_file(file_content):
             line = line.strip()
             if line.isdigit():
                 val = int(line)
-                if 300 < val < 2000: # Filtro fisiologico
-                    rr_intervals.append(val)
+                if 300 < val < 2000: rr_intervals.append(val)
         
         if len(rr_intervals) < 10: return None, None
 
         rr_array = np.array(rr_intervals)
-        # rMSSD & RHR
         diffs = np.diff(rr_array)
         rmssd = np.sqrt(np.mean(np.square(diffs)))
         rhr = 60000 / np.mean(rr_array)
         
         return round(rmssd, 2), round(rhr, 1)
-    except Exception:
-        return None, None
+    except: return None, None
 
 def extract_date_from_filename(filename):
-    """Estrae la data dal nome file 'YYYY-MM-DD HH-MM-SS.txt'."""
     try:
         name_clean = os.path.splitext(filename)[0]
         timestamp = datetime.strptime(name_clean, "%Y-%m-%d %H-%M-%S")
         return timestamp
-    except ValueError:
-        return None
+    except ValueError: return None
 
-# --- 2. PARSING FILE GARMIN (CSV) ---
-def parse_garmin_file(uploaded_file):
-    """Legge il CSV Garmin e standardizza le colonne."""
+# --- 2. PARSING GARMIN SONNO ---
+def parse_garmin_sleep(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
-        date_col = df.columns[0] # Assume la prima colonna come data
-        
+        date_col = df.columns[0]
         df = df.rename(columns={
-            date_col: 'Date',
-            'Dormire': 'Sleep_Start',
-            'Durata': 'Sleep_Duration',
-            'Qualità': 'Sleep_Quality'
+            date_col: 'Date', 'Dormire': 'Sleep_Start', 
+            'Durata': 'Sleep_Duration', 'Qualità': 'Sleep_Quality'
         })
-        
         df['Date'] = pd.to_datetime(df['Date'])
         
-        # Pulizia Durata
         def clean_duration(val):
             if pd.isna(val): return 0
             val = str(val).lower().replace('h', '').replace('min', '')
@@ -74,239 +62,253 @@ def parse_garmin_file(uploaded_file):
             return 0
             
         df['Sleep_Hours'] = df['Sleep_Duration'].apply(clean_duration)
-        
-        # Mapping Qualità
         quality_map = {'Eccellente': 9, 'Buono': 8, 'Discreto': 6, 'Scarso': 4}
         df['Feel_Score'] = df['Sleep_Quality'].map(quality_map).fillna(5)
         
         return df[['Date', 'Sleep_Hours', 'Feel_Score']]
     except Exception as e:
-        st.error(f"Errore lettura Garmin: {e}")
+        st.error(f"Errore file Sonno: {e}")
         return pd.DataFrame()
 
-# --- GESTIONE DATABASE E CALCOLI ---
+# --- 3. PARSING GARMIN ATTIVITÀ (CON LOGICA SMART LOAD) ---
+def parse_garmin_activities(uploaded_file):
+    try:
+        df = pd.read_csv(uploaded_file)
+        
+        # Pulizia base
+        df['Data'] = pd.to_datetime(df['Data'])
+        df['Date_Day'] = df['Data'].dt.date
+        
+        # Helper Numerici
+        def clean_num(x):
+            if pd.isna(x): return 0.0
+            return float(str(x).replace(',', ''))
+
+        def clean_time(x):
+            try:
+                parts = str(x).split(':')
+                if len(parts) == 3: return int(parts[0])*60 + int(parts[1]) + float(parts[2])/60
+                elif len(parts) == 2: return int(parts[0]) + float(parts[1])/60
+                return 0.0
+            except: return 0.0
+
+        # Colonne necessarie
+        df['Mins'] = df['Tempo'].apply(clean_time)
+        df['TE'] = df['TE aerobico'].apply(clean_num)
+        df['TSS'] = df['Training Stress Score®'].apply(clean_num)
+        df['Type'] = df['Tipo di attività'].astype(str)
+        df['Dist_km'] = df['Distanza'].apply(clean_num)
+
+        # --- ALGORITMO "SMART LOAD" ---
+        def calculate_load(row):
+            # 1. Se TSS è affidabile (> 10), usalo
+            if row['TSS'] > 10:
+                return row['TSS']
+            
+            # 2. Altrimenti: Calcolo Eco-Load (Durata * TE)
+            # Se TE è mancante (es. nuoto manuale), assumiamo 2.0 (basso) o 3.0 (medio)
+            te_val = row['TE'] if row['TE'] > 0 else 2.5 
+            base_load = row['Mins'] * te_val
+            
+            # 3. Fattore Correttivo Attività (CNS Multiplier)
+            activity_type = row['Type'].lower()
+            multiplier = 1.0
+            
+            if any(x in activity_type for x in ['forza', 'palestra', 'pesi', 'crossfit', 'strength']):
+                multiplier = 1.5 # Boost per stress nervoso
+            elif any(x in activity_type for x in ['yoga', 'pilates']):
+                multiplier = 0.5 # Riduzione per recupero attivo
+                
+            return base_load * multiplier
+
+        df['Load_Score'] = df.apply(calculate_load, axis=1)
+
+        # Aggregazione Giornaliera
+        daily_grp = df.groupby('Date_Day').agg({
+            'Load_Score': 'sum',    # Somma tutto il carico del giorno
+            'Dist_km': 'sum',
+            'Mins': 'sum'
+        }).reset_index()
+        
+        daily_grp = daily_grp.rename(columns={'Date_Day': 'Date'})
+        daily_grp['Date'] = pd.to_datetime(daily_grp['Date'])
+        
+        return daily_grp
+
+    except Exception as e:
+        st.error(f"Errore file Attività: {e}")
+        return pd.DataFrame()
+
+# --- GESTIONE DATABASE ---
 def load_db():
+    cols = ['Date', 'rMSSD', 'RHR', 'Sleep', 'Feel', 'Status', 'Daily_Load', 'Daily_Dist', 'Daily_TrainTime']
     if os.path.exists(DB_FILE):
         df = pd.read_csv(DB_FILE, parse_dates=['Date'])
-        # Assicuriamoci che tutte le colonne esistano
-        required_cols = ['Date', 'rMSSD', 'RHR', 'Sleep', 'Feel', 'Status']
-        for col in required_cols:
-            if col not in df.columns:
-                df[col] = np.nan if col != 'Status' else 'Da Calcolare'
+        for col in cols:
+            if col not in df.columns: df[col] = np.nan
         return df
     else:
-        return pd.DataFrame(columns=['Date', 'rMSSD', 'RHR', 'Sleep', 'Feel', 'Status'])
+        return pd.DataFrame(columns=cols)
 
 def recalculate_status(df):
-    """Ricalcola lo status (Traffic Light) per tutto il dataframe."""
     df = df.sort_values('Date').reset_index(drop=True)
-    
     new_statuses = []
     
-    # Per calcolare le medie mobili correttamente
     for i in range(len(df)):
-        current_row = df.iloc[i]
+        row = df.iloc[i]
         
-        # Se mancano dati critici, saltiamo il calcolo
-        if pd.isna(current_row['rMSSD']) or pd.isna(current_row['RHR']):
-            new_statuses.append("⚪ DATI PARZIALI")
+        # Saltiamo se manca HRV
+        if pd.isna(row['rMSSD']):
+            new_statuses.append("⚪ DATI MANCANTI")
             continue
 
-        # Storico: prendiamo fino a 7 giorni precedenti (escludendo oggi)
+        # Baseline storica (7gg)
         history = df.iloc[:i].tail(7)
-        
         if len(history) < 3:
-            new_statuses.append("⚪ DATI INSUFFICIENTI")
+            new_statuses.append("⚪ START UP")
             continue
             
         base_rmssd = history['rMSSD'].mean()
-        base_rhr = history['RHR'].mean()
         
-        rmssd = current_row['rMSSD']
-        rhr = current_row['RHR']
-        sleep = current_row['Sleep'] if not pd.isna(current_row['Sleep']) else 7.5
-        feel = current_row['Feel'] if not pd.isna(current_row['Feel']) else 7
-        
-        # Logica IF-THEN
-        status = "🟢 GO"
-        if rmssd < base_rmssd * 0.85 and rhr > base_rhr * 1.05:
-            status = "🔴 RIPOSO (Crash)"
-        elif rmssd < base_rmssd * 0.90 or rhr > base_rhr * 1.03 or feel < 6:
-            status = "🟡 CAUTELA"
-        elif rmssd > base_rmssd * 1.30 and sleep < 7:
-            status = "🟡 PARADOSSO"
+        # Logica Semaforo Semplificata
+        rmssd = row['rMSSD']
+        # Se HRV crolla > 15% sotto media -> Rosso
+        if rmssd < base_rmssd * 0.85:
+            new_statuses.append("🔴 RIPOSO (Stress Acuto)")
+        # Se HRV scende leggermente o Feel è basso -> Giallo
+        elif rmssd < base_rmssd * 0.95 or (pd.notna(row['Feel']) and row['Feel'] < 6):
+            new_statuses.append("🟡 CAUTELA")
+        # Altrimenti -> Verde
+        else:
+            new_statuses.append("🟢 GO")
             
-        new_statuses.append(status)
-        
     df['Status'] = new_statuses
     return df
 
-# --- LOGICA AGGIORNAMENTO SEPARATO ---
-
-def process_hrv_upload(uploaded_files):
-    """Carica SOLO HRV e aggiorna/inserisce nel DB."""
+# --- UPLOAD E UPDATE ---
+def update_db_generic(new_df, merge_cols):
     current_db = load_db()
     
-    new_data = []
-    for f in uploaded_files:
-        dt = extract_date_from_filename(f.name)
-        if dt:
-            rmssd, rhr = parse_rr_file(f.getvalue())
-            if rmssd:
-                new_data.append({'Date': dt, 'rMSSD': rmssd, 'RHR': rhr})
-    
-    if not new_data:
-        st.warning("Nessun dato valido trovato nei file.")
-        return
-
-    df_new = pd.DataFrame(new_data)
-    
-    # Merge Intelligente:
-    # 1. Convertiamo Date in colonna chiave
+    # Prepara key di merge (Data Giorno)
     current_db['Date'] = pd.to_datetime(current_db['Date'])
-    df_new['Date'] = pd.to_datetime(df_new['Date'])
-    
-    # 2. Iteriamo sui nuovi dati per aggiornare o inserire
-    count_updated = 0
-    count_new = 0
-    
-    for _, row in df_new.iterrows():
-        mask = current_db['Date'] == row['Date']
-        if current_db[mask].empty:
-            # Nuova riga
-            new_row = row.to_dict()
-            new_row['Sleep'] = np.nan # Lasciamo vuoto se non c'è
-            new_row['Feel'] = np.nan
-            current_db = pd.concat([current_db, pd.DataFrame([new_row])], ignore_index=True)
-            count_new += 1
-        else:
-            # Aggiorna esistente (solo colonne HRV)
-            idx = current_db[mask].index[0]
-            current_db.at[idx, 'rMSSD'] = row['rMSSD']
-            current_db.at[idx, 'RHR'] = row['RHR']
-            count_updated += 1
-            
-    # Ricalcola status e salva
-    final_db = recalculate_status(current_db)
-    final_db.to_csv(DB_FILE, index=False)
-    st.success(f"✅ HRV Elaborato: {count_new} nuovi record, {count_updated} aggiornati.")
-
-def process_garmin_upload(garmin_file):
-    """Carica SOLO Garmin e aggiorna/inserisce nel DB."""
-    current_db = load_db()
-    df_garmin = parse_garmin_file(garmin_file)
-    
-    if df_garmin.empty: return
-
-    current_db['Date'] = pd.to_datetime(current_db['Date'])
-    # Normalizziamo le date al 'giorno' per il matching (evita mismatch di ore)
     current_db['Date_Day'] = current_db['Date'].dt.date
-    df_garmin['Date_Day'] = df_garmin['Date'].dt.date
     
-    count_merged = 0
-    count_added = 0
+    new_df['Date'] = pd.to_datetime(new_df['Date'])
+    new_df['Date_Day'] = new_df['Date'].dt.date
     
-    for _, row in df_garmin.iterrows():
+    cnt_new, cnt_upd = 0, 0
+    
+    for _, row in new_df.iterrows():
         mask = current_db['Date_Day'] == row['Date_Day']
         
         if current_db[mask].empty:
-            # Se la data non esiste (es. hai il sonno ma non hai ancora misurato HRV)
-            # Creiamo la riga usando la data del Garmin
-            new_row = {
-                'Date': row['Date'], # Usiamo il timestamp del Garmin
-                'rMSSD': np.nan,
-                'RHR': np.nan,
-                'Sleep': row['Sleep_Hours'],
-                'Feel': row['Feel_Score']
-            }
-            current_db = pd.concat([current_db, pd.DataFrame([new_row])], ignore_index=True)
-            # Rigeneriamo la colonna Date_Day per i prossimi cicli
-            current_db['Date_Day'] = current_db['Date'].dt.date
-            count_added += 1
+            # Crea nuova riga
+            new_entry = {k: np.nan for k in current_db.columns if k not in ['Date', 'Date_Day']}
+            new_entry['Date'] = row['Date']
+            for c in merge_cols: 
+                if c in row: new_entry[c] = row[c]
+            
+            current_db = pd.concat([current_db, pd.DataFrame([new_entry])], ignore_index=True)
+            current_db['Date_Day'] = current_db['Date'].dt.date # Refresh key
+            cnt_new += 1
         else:
-            # Aggiorna riga esistente
+            # Aggiorna
             idx = current_db[mask].index[0]
-            current_db.at[idx, 'Sleep'] = row['Sleep_Hours']
-            current_db.at[idx, 'Feel'] = row['Feel_Score']
-            count_merged += 1
+            for c in merge_cols:
+                if c in row and pd.notna(row[c]):
+                    current_db.at[idx, c] = row[c]
+            cnt_upd += 1
             
-    # Pulizia colonna temporanea
-    if 'Date_Day' in current_db.columns:
-        current_db = current_db.drop(columns=['Date_Day'])
-        
-    final_db = recalculate_status(current_db)
-    final_db.to_csv(DB_FILE, index=False)
-    st.success(f"✅ Garmin Elaborato: {count_merged} giorni aggiornati, {count_added} nuovi inseriti.")
+    if 'Date_Day' in current_db.columns: current_db.drop(columns=['Date_Day'], inplace=True)
+    
+    final = recalculate_status(current_db)
+    final.to_csv(DB_FILE, index=False)
+    return cnt_new, cnt_upd
 
-# --- INTERFACCIA UTENTE (SIDEBAR) ---
-
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("📂 1. Importazione HRV")
-    st.caption("Carica i file .txt delle misurazioni")
-    hrv_files = st.file_uploader("File TXT HRV", type=['txt'], accept_multiple_files=True, key="hrv_up")
-    
-    if hrv_files:
-        if st.button("💾 Elabora File HRV"):
-            process_hrv_upload(hrv_files)
-            st.rerun() # Ricarica la pagina per vedere i dati
-            
-    st.markdown("---")
-    
-    st.header("⌚ 2. Importazione Garmin")
-    st.caption("Carica il file 'Riposo.csv' unico")
-    garmin_file = st.file_uploader("File CSV Garmin", type=['csv'], key="garm_up")
-    
-    if garmin_file:
-        if st.button("🔄 Aggiorna Dati Sonno"):
-            process_garmin_upload(garmin_file)
+    st.header("📂 1. HRV")
+    f_hrv = st.file_uploader("File TXT", type=['txt'], accept_multiple_files=True)
+    if f_hrv and st.button("Carica HRV"):
+        data = []
+        for f in f_hrv:
+            dt = extract_date_from_filename(f.name)
+            if dt:
+                r, h = parse_rr_file(f.getvalue())
+                if r: data.append({'Date': dt, 'rMSSD': r, 'RHR': h})
+        if data:
+            n, u = update_db_generic(pd.DataFrame(data), ['rMSSD', 'RHR'])
+            st.success(f"HRV: {n} nuovi, {u} agg.")
             st.rerun()
 
-# --- DASHBOARD PRINCIPALE ---
+    st.header("🌙 2. Sonno")
+    f_sleep = st.file_uploader("Riposo.csv", type=['csv'])
+    if f_sleep and st.button("Carica Sonno"):
+        df_s = parse_garmin_sleep(f_sleep)
+        if not df_s.empty:
+            n, u = update_db_generic(df_s, ['Sleep', 'Feel'])
+            st.success(f"Sonno: {n} nuovi, {u} agg.")
+            st.rerun()
 
+    st.header("🏋️ 3. Attività")
+    f_act = st.file_uploader("Activities.csv", type=['csv'])
+    if f_act and st.button("Carica Attività"):
+        df_a = parse_garmin_activities(f_act)
+        if not df_a.empty:
+            # Mapping nomi
+            df_a = df_a.rename(columns={'Mins': 'Daily_TrainTime', 'Load_Score': 'Daily_Load', 'Dist_km': 'Daily_Dist'})
+            n, u = update_db_generic(df_a, ['Daily_Load', 'Daily_TrainTime', 'Daily_Dist'])
+            st.success(f"Attività: {n} nuovi, {u} agg.")
+            st.rerun()
+
+# --- DASHBOARD ---
 df = load_db()
 
 if not df.empty:
     df = df.sort_values('Date')
-    last_entry = df.iloc[-1]
+    last = df.iloc[-1]
     
-    st.subheader(f"📅 Ultimo Aggiornamento: {last_entry['Date'].strftime('%d/%m/%Y')}")
+    st.subheader(f"📊 Report: {last['Date'].strftime('%d/%m/%Y')}")
     
-    # Gestione visualizzazione NaN nei metric
-    rmssd_val = f"{last_entry['rMSSD']} ms" if pd.notna(last_entry['rMSSD']) else "--"
-    sleep_val = f"{last_entry['Sleep']} h" if pd.notna(last_entry['Sleep']) else "--"
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("rMSSD", rmssd_val)
-    col2.metric("RHR", f"{last_entry['RHR']} bpm" if pd.notna(last_entry['RHR']) else "--")
-    col3.metric("Sonno", sleep_val)
-    col4.metric("Status", last_entry['Status'])
-
-    # Messaggio Status
-    status_msg = str(last_entry['Status'])
-    if "🟢" in status_msg: st.success(f"## {status_msg}")
-    elif "🟡" in status_msg: st.warning(f"## {status_msg}")
-    elif "🔴" in status_msg: st.error(f"## {status_msg}")
-    else: st.info(f"## {status_msg}")
+    # KPI
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("rMSSD (Fisiologia)", f"{last['rMSSD']} ms", delta_color="normal")
+    k2.metric("Load (Carico)", f"{int(last['Daily_Load'])}" if pd.notna(last['Daily_Load']) else "--", help="Punteggio Calcolato: Durata x Intensità (con boost Forza)")
+    k3.metric("Sonno", f"{last['Sleep']} h")
+    k4.metric("Status", last['Status'])
 
     st.divider()
 
-    # --- TABS GRAFICI ---
-    tab1, tab2, tab3 = st.tabs(["🫀 Fisiologia", "🌙 Sonno & Recupero", "📝 Database"])
+    # --- GRAFICI CORRELAZIONE ---
+    t1, t2, t3 = st.tabs(["⚡ Carico vs HRV", "🌙 Recupero", "📝 Dati"])
     
-    with tab1:
-        st.line_chart(df.set_index('Date')[['rMSSD', 'RHR']], color=["#0000FF", "#FF0000"])
-    
-    with tab2:
-        col_g1, col_g2 = st.columns(2)
-        with col_g1:
-            st.markdown("##### Durata Sonno")
-            st.bar_chart(df.set_index('Date')['Sleep'], color="#6A0DAD")
-        with col_g2:
-            st.markdown("##### Sensazione (Feel)")
+    with t1:
+        st.markdown("#### Impatto dell'Allenamento sulla Fisiologia")
+        st.caption("Barre Viola = Quanto ti sei allenato (Load). Linea Blu = Il tuo HRV (rMSSD).")
+        st.caption("Cerca questo pattern: Barra Alta oggi -> Linea che scende domani.")
+        
+        # Grafico Combo personalizzato
+        chart_data = df.set_index('Date')[['Daily_Load', 'rMSSD']].copy()
+        
+        # Visualizzazione con due assi Y sarebbe l'ideale, qui usiamo st.bar_chart e st.line_chart separati ma vicini
+        # o normalizzati. Per semplicità Streamlit:
+        c1, c2 = st.columns([3, 1])
+        with c1:
+             st.bar_chart(chart_data['Daily_Load'], color="#800080") # Viola
+        with c2:
+             st.line_chart(chart_data['rMSSD'], color="#0000FF")   # Blu
+
+    with t2:
+        c_s1, c_s2 = st.columns(2)
+        with c_s1: 
+            st.markdown("**Quantità Sonno (h)**")
+            st.bar_chart(df.set_index('Date')['Sleep'], color="#2E8B57")
+        with c_s2: 
+            st.markdown("**Qualità Percepita (1-10)**")
             st.line_chart(df.set_index('Date')['Feel'], color="#FFA500")
 
-    with tab3:
+    with t3:
         st.dataframe(df.sort_values('Date', ascending=False))
 
 else:
-    st.info("👋 Database vuoto. Usa la barra laterale per caricare i dati (HRV o Garmin).")
+    st.info("Inizia caricando i file dalla barra laterale.")
