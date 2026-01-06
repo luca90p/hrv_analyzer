@@ -9,17 +9,15 @@ st.set_page_config(page_title="HRV Engineer Dashboard", layout="wide", page_icon
 
 # Titolo e Header
 st.title("🫀 HRV Engineer Dashboard")
-st.markdown("### Monitoraggio Ingegneristico - Caricamento Massivo")
+st.markdown("### Monitoraggio Ingegneristico - Integrazione Garmin & HRV")
 
 # --- NOME DEL DATABASE ---
 DB_FILE = 'hrv_database.csv'
 
-# --- FUNZIONI DI SERVIZIO (BACKEND) ---
-
+# --- 1. PARSING FILE HRV (RAW TXT) ---
 def parse_rr_file(file_content):
     """
-    Legge il contenuto raw del file.
-    Estrae gli intervalli RR e calcola rMSSD e RHR.
+    Legge il contenuto raw del file TXT con gli intervalli RR.
     """
     try:
         content = file_content.decode("utf-8").splitlines()
@@ -54,33 +52,71 @@ def parse_rr_file(file_content):
         return None, None
 
 def extract_date_from_filename(filename):
-    """
-    Estrae la data dal nome del file formato 'YYYY-MM-DD HH-MM-SS.txt'.
-    """
+    """Estrae la data dal nome file 'YYYY-MM-DD HH-MM-SS.txt'."""
     try:
-        # Rimuove l'estensione (.txt o .csv)
         name_clean = os.path.splitext(filename)[0]
-        # Converte la stringa in oggetto datetime
         timestamp = datetime.strptime(name_clean, "%Y-%m-%d %H-%M-%S")
         return timestamp
     except ValueError:
         return None
 
+# --- 2. PARSING FILE GARMIN (CSV) ---
+def parse_garmin_file(uploaded_file):
+    """
+    Legge il CSV di riposo Garmin e standardizza le colonne.
+    """
+    try:
+        df = pd.read_csv(uploaded_file)
+        
+        # Mapping dinamico delle colonne (basato sul file che hai caricato)
+        # Cerchiamo la colonna data che spesso ha nomi strani come 'Punteggio sonno 7 giorni'
+        date_col = df.columns[0] 
+        
+        df = df.rename(columns={
+            date_col: 'Date',
+            'Dormire': 'Sleep_Start',
+            'Durata': 'Sleep_Duration',
+            'Qualità': 'Sleep_Quality'
+        })
+        
+        # Pulizia Data
+        df['Date'] = pd.to_datetime(df['Date'])
+        
+        # Pulizia Durata (da "7h 53min" a float 7.88 o stringa pulita)
+        # Per ora manteniamo la stringa per visualizzazione, o estraiamo le ore se serve per calcoli
+        def clean_duration(val):
+            if pd.isna(val): return 0
+            val = str(val).lower().replace('h', '').replace('min', '')
+            parts = val.split()
+            if len(parts) == 2:
+                return round(float(parts[0]) + float(parts[1])/60, 2)
+            elif len(parts) == 1:
+                return float(parts[0])
+            return 0
+            
+        df['Sleep_Hours'] = df['Sleep_Duration'].apply(clean_duration)
+        
+        # Mappa Qualità in voto numerico (opzionale, utile per i grafici)
+        quality_map = {'Eccellente': 9, 'Buono': 8, 'Discreto': 6, 'Scarso': 4}
+        df['Feel_Score'] = df['Sleep_Quality'].map(quality_map).fillna(5)
+        
+        return df[['Date', 'Sleep_Start', 'Sleep_Hours', 'Feel_Score', 'Sleep_Quality']]
+    except Exception as e:
+        st.error(f"Errore lettura Garmin: {e}")
+        return pd.DataFrame()
+
+# --- GESTIONE DATABASE ---
 def load_db():
-    """Carica il database CSV esistente o ne crea uno vuoto."""
     if os.path.exists(DB_FILE):
         return pd.read_csv(DB_FILE, parse_dates=['Date'])
     else:
         return pd.DataFrame(columns=['Date', 'rMSSD', 'RHR', 'Sleep', 'Feel', 'Status'])
 
 def get_traffic_light(rmssd, rhr, sleep, feel, df_history):
-    """
-    Algoritmo decisionale basato su media mobile 7gg.
-    """
+    """Algoritmo decisionale basato su media mobile 7gg."""
     if df_history.empty or len(df_history) < 3:
         return "⚪ DATI INSUFFICIENTI (Start)"
     
-    # Calcolo Baseline (Media ultimi 7 record inseriti PRIMA di questo)
     last_7 = df_history.tail(7)
     base_rmssd = last_7['rMSSD'].mean()
     base_rhr = last_7['RHR'].mean()
@@ -95,121 +131,132 @@ def get_traffic_light(rmssd, rhr, sleep, feel, df_history):
     else:
         return "🟢 GO"
 
-def process_batch_upload(uploaded_files, default_sleep, default_feel):
+# --- PROCESSO DI MERGE (CORE LOGIC) ---
+def process_data_integration(hrv_files, garmin_file):
     """
-    Gestisce il caricamento di più file, li ordina e aggiorna il DB.
+    1. Legge HRV
+    2. Legge Garmin
+    3. Unisce (Merge) su Data
+    4. Aggiorna DB
     """
+    st.write("⏳ Elaborazione in corso...")
+    
+    # A. Elaborazione HRV
+    hrv_data = []
+    for f in hrv_files:
+        dt = extract_date_from_filename(f.name)
+        if dt:
+            rmssd, rhr = parse_rr_file(f.getvalue())
+            if rmssd:
+                # Normalizziamo la data al giorno (senza ore) per il merge con Garmin
+                hrv_data.append({
+                    'Date': dt,             # Data precisa (timestamp)
+                    'Date_Day': dt.date(),  # Data giorno (key per merge)
+                    'rMSSD': rmssd, 
+                    'RHR': rhr
+                })
+    
+    df_hrv = pd.DataFrame(hrv_data)
+    if df_hrv.empty:
+        st.warning("Nessun dato HRV valido trovato.")
+        return load_db()
+
+    # B. Elaborazione Garmin (se presente)
+    df_garmin = pd.DataFrame()
+    if garmin_file:
+        df_garmin = parse_garmin_file(garmin_file)
+        if not df_garmin.empty:
+            df_garmin['Date_Day'] = df_garmin['Date'].dt.date # Key per merge
+            
+    # C. Unione (Left Join su HRV perché è il driver principale)
+    # Se c'è Garmin, uniamo. Altrimenti usiamo default.
+    final_rows = []
+    
+    # Ordiniamo per data
+    df_hrv = df_hrv.sort_values(by='Date')
+    
+    # Carichiamo storico attuale per calcolo status
     df_current = load_db()
-    
-    new_entries = []
-    
-    # Barra di progresso
-    progress_bar = st.progress(0)
-    total_files = len(uploaded_files)
+    temp_history = df_current.copy()
 
-    for i, uploaded_file in enumerate(uploaded_files):
-        # 1. Estrazione Data dal Nome File
-        file_date = extract_date_from_filename(uploaded_file.name)
+    for _, row in df_hrv.iterrows():
+        # Dati HRV base
+        entry = {
+            'Date': row['Date'],
+            'rMSSD': row['rMSSD'],
+            'RHR': row['RHR'],
+            'Sleep': 7.5, # Default
+            'Feel': 7,    # Default
+            'Status': 'Calcolo...'
+        }
         
-        if file_date is None:
-            st.error(f"❌ Nome file non valido: {uploaded_file.name}. Deve essere 'YYYY-MM-DD HH-MM-SS'.")
-            continue
-            
-        # 2. Parsing Metriche
-        rmssd, rhr = parse_rr_file(uploaded_file.getvalue())
+        # Cerca corrispondenza Garmin
+        if not df_garmin.empty:
+            # Filtriamo per giorno corrispondente
+            match = df_garmin[df_garmin['Date_Day'] == row['Date_Day']]
+            if not match.empty:
+                # Trovato! Sovrascriviamo i default
+                garmin_row = match.iloc[0]
+                entry['Sleep'] = garmin_row['Sleep_Hours']
+                entry['Feel'] = garmin_row['Feel_Score']
+                # Opzionale: puoi salvare anche Sleep_Start se aggiungi la colonna al DB
         
-        if rmssd is not None:
-            new_entries.append({
-                'Date': file_date,
-                'rMSSD': rmssd,
-                'RHR': rhr,
-                'Sleep': default_sleep, # Valori di default per importazione massiva
-                'Feel': default_feel,
-                'Status': 'Da Calcolare'
-            })
-        else:
-            st.warning(f"⚠️ File vuoto o corrotto: {uploaded_file.name}")
+        # Calcolo Status (Logica progressiva)
+        # Evitiamo duplicati esatti nel temp_history prima del calcolo
+        if not temp_history.empty and row['Date'] in temp_history['Date'].values:
+             pass # Se esiste già, ricalcoliamo o saltiamo? Per ora calcoliamo per la nuova entry
         
-        progress_bar.progress((i + 1) / total_files)
+        status = get_traffic_light(
+            entry['rMSSD'], entry['RHR'], entry['Sleep'], entry['Feel'], temp_history
+        )
+        entry['Status'] = status
+        
+        final_rows.append(entry)
+        
+        # Aggiorna storico temporaneo per il prossimo loop
+        temp_history = pd.concat([temp_history, pd.DataFrame([entry])], ignore_index=True)
 
-    # Se abbiamo nuovi dati
-    if new_entries:
-        df_new = pd.DataFrame(new_entries)
+    # D. Salvataggio
+    if final_rows:
+        df_new = pd.DataFrame(final_rows)
+        # Concatenazione col vecchio DB
+        df_updated = pd.concat([df_current, df_new], ignore_index=True)
+        # Rimozione duplicati (tieni l'ultimo caricato)
+        df_updated = df_updated.drop_duplicates(subset=['Date'], keep='last')
+        df_updated = df_updated.sort_values(by='Date')
         
-        # 3. Ordinamento Fondamentale: Ordiniamo i nuovi file per data
-        df_new = df_new.sort_values(by='Date')
-
-        # 4. Calcolo dello Status Iterativo
-        # Dobbiamo calcolare lo status riga per riga simulando il passare del tempo
-        # Uniamo temporaneamente al vecchio DB per avere lo storico
-        
-        final_rows_to_add = []
-        
-        # Creiamo una copia di lavoro dello storico attuale
-        temp_history = df_current.copy()
-        
-        for index, row in df_new.iterrows():
-            # Controlliamo duplicati
-            if not temp_history.empty:
-                # Se esiste già una data uguale (giorno preciso), saltiamo o sovrascriviamo?
-                # Qui saltiamo per sicurezza se la data esatta esiste già
-                if row['Date'] in temp_history['Date'].values:
-                    continue
-            
-            # Calcola status usando la storia accumulata fino a quel momento
-            status = get_traffic_light(
-                row['rMSSD'], 
-                row['RHR'], 
-                row['Sleep'], 
-                row['Feel'], 
-                temp_history
-            )
-            
-            row['Status'] = status
-            final_rows_to_add.append(row)
-            
-            # Aggiungiamo questa riga alla history per il calcolo della prossima iterazione
-            temp_history = pd.concat([temp_history, row.to_frame().T], ignore_index=True)
-
-        # 5. Salvataggio Finale
-        if final_rows_to_add:
-            df_final_add = pd.DataFrame(final_rows_to_add)
-            df_updated = pd.concat([df_current, df_final_add], ignore_index=True)
-            df_updated = df_updated.sort_values(by='Date')
-            # Rimuove duplicati esatti se presenti
-            df_updated = df_updated.drop_duplicates(subset=['Date'], keep='last')
-            
-            df_updated.to_csv(DB_FILE, index=False)
-            st.success(f"✅ Importati correttamente {len(final_rows_to_add)} nuovi file!")
-            return df_updated
-        else:
-            st.info("Nessun dato nuovo da aggiungere (forse duplicati?).")
-            return df_current
+        df_updated.to_csv(DB_FILE, index=False)
+        st.success(f"✅ Database aggiornato! Elaborati {len(final_rows)} record.")
+        return df_updated
     
     return df_current
 
 # --- INTERFACCIA UTENTE (SIDEBAR) ---
 
 with st.sidebar:
-    st.header("📂 Importazione Dati")
-    
-    # Widget per file multipli
-    uploaded_files = st.file_uploader(
-        "Carica i file .txt (Nomi: YYYY-MM-DD HH-MM-SS)", 
+    st.header("📂 1. Carica HRV")
+    hrv_files = st.file_uploader(
+        "File .txt (Nomi: YYYY-MM-DD HH-MM-SS)", 
         type=['txt'], 
-        accept_multiple_files=True
+        accept_multiple_files=True,
+        key="hrv_uploader"
     )
     
     st.markdown("---")
-    st.markdown("**Impostazioni per importazione massiva**")
-    st.caption("Poiché stai caricando dati passati, inserisci valori medi per questi parametri:")
     
-    default_sleep = st.number_input("Sonno Default (h)", 4.0, 12.0, 7.5, 0.5)
-    default_feel = st.slider("Feel Default (1-10)", 1, 10, 7)
+    st.header("⌚ 2. Carica Garmin")
+    st.caption("Opzionale: Se carichi questo file, sonno e sensazioni verranno presi da qui automaticamente.")
+    garmin_file = st.file_uploader(
+        "File 'Riposo.csv' esportato da Garmin",
+        type=['csv'],
+        key="garmin_uploader"
+    )
     
-    if uploaded_files:
-        if st.button("🚀 Elabora File Caricati"):
-            df = process_batch_upload(uploaded_files, default_sleep, default_feel)
+    st.markdown("---")
+    
+    if hrv_files:
+        if st.button("🚀 Elabora e Unisci Dati"):
+            df = process_data_integration(hrv_files, garmin_file)
             st.balloons()
 
 # --- DASHBOARD PRINCIPALE ---
@@ -241,7 +288,7 @@ if not df.empty:
     # --- GRAFICI DEI TREND ---
     st.subheader("📈 Analisi Storica")
     
-    tab1, tab2 = st.tabs(["Fisiologia (rMSSD & RHR)", "Database"])
+    tab1, tab2 = st.tabs(["Fisiologia (rMSSD & RHR)", "Database Completo"])
     
     with tab1:
         st.line_chart(df.set_index('Date')[['rMSSD', 'RHR']], color=["#0000FF", "#FF0000"])
@@ -250,4 +297,4 @@ if not df.empty:
         st.dataframe(df.sort_values('Date', ascending=False))
 
 else:
-    st.info("👋 Il database è vuoto. Carica i file dalla barra laterale.")
+    st.info("👋 Il database è vuoto. Carica i file HRV (e opzionalmente Garmin) dalla barra laterale.")
