@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import os
+import altair as alt
 from datetime import datetime, timedelta
 
 # --- CONFIGURAZIONE PAGINA ---
@@ -60,7 +61,7 @@ def parse_garmin_sleep(uploaded_file):
         return df[['Date', 'Sleep_Hours', 'Feel_Score']]
     except: return pd.DataFrame()
 
-# --- 3. PARSING ATTIVITÀ (LOGICA AVANZATA) ---
+# --- 3. PARSING ATTIVITÀ (CON CATEGORIE) ---
 def parse_garmin_activities(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
@@ -83,54 +84,69 @@ def parse_garmin_activities(uploaded_file):
         df['Mins'] = df['Tempo'].apply(clean_time)
         df['TE'] = df['TE aerobico'].apply(clean_num)
         df['TSS'] = df['Training Stress Score®'].apply(clean_num)
-        df['Type'] = df['Tipo di attività'].astype(str)
+        df['Type_Raw'] = df['Tipo di attività'].astype(str)
         df['Dist_km'] = df['Distanza'].apply(clean_num)
-        # Estrazione Ora per Cronobiologia
         df['Hour'] = df['Data'].dt.hour
+
+        # Categorizzazione Attività per i Colori
+        def get_category(s):
+            s = s.lower()
+            if 'corsa' in s: return 'Load_Corsa'
+            if 'ciclismo' in s or 'bici' in s: return 'Load_Bici'
+            return 'Load_Altro' # Palestra, Camminata, ecc
+
+        df['Category'] = df['Type_Raw'].apply(get_category)
 
         # --- ALGORITMO "SMART LOAD 2.0" ---
         def calculate_load(row):
-            # A. Base Load (TSS Normalizzato)
+            # A. Base Load
             base_load = 0
-            
             if row['TSS'] > 10:
-                # Se abbiamo il TSS vero (Bici), usiamo quello
                 base_load = row['TSS']
             else:
-                # Se manca TSS (Corsa/Palestra), stimiamo: (Durata * TE) / 3
-                # Il fattore /3 normalizza la scala a quella del TSS (approx)
                 te_val = row['TE'] if row['TE'] > 0 else 2.5
                 base_load = (row['Mins'] * te_val) / 3.0
             
-            # B. Moltiplicatore Attività (CNS Impact)
+            # B. Moltiplicatore Attività (Palestra)
             activity_mult = 1.0
-            act_type = row['Type'].lower()
-            if any(x in act_type for x in ['forza', 'palestra', 'pesi', 'crossfit', 'strength']):
-                activity_mult = 1.5 # Boost neurale
+            act_type = row['Type_Raw'].lower()
+            if any(x in act_type for x in ['forza', 'palestra', 'pesi', 'crossfit']):
+                activity_mult = 1.5 
             
-            # C. Moltiplicatore Orario (Late Night Penalty)
+            # C. Moltiplicatore Orario
             time_mult = 1.0
-            hour = row['Hour']
-            if hour >= 21:     # Dopo le 21:00
-                time_mult = 1.20 # +20% Stress
-            elif hour >= 18:   # Dopo le 18:00
-                time_mult = 1.10 # +10% Stress
+            if row['Hour'] >= 21: time_mult = 1.20
+            elif row['Hour'] >= 18: time_mult = 1.10
                 
             return base_load * activity_mult * time_mult
 
         df['Load_Score'] = df.apply(calculate_load, axis=1)
 
-        # Aggregazione Giornaliera
-        daily_grp = df.groupby('Date_Day').agg({
-            'Load_Score': 'sum',
+        # Pivot per avere colonne separate per tipo attività
+        pivot_df = df.pivot_table(
+            index='Date_Day', 
+            columns='Category', 
+            values='Load_Score', 
+            aggfunc='sum',
+            fill_value=0
+        ).reset_index()
+
+        # Calcoli totali
+        agg_total = df.groupby('Date_Day').agg({
             'Dist_km': 'sum',
             'Mins': 'sum'
         }).reset_index()
+
+        # Merge del pivot con i totali
+        final_daily = pd.merge(pivot_df, agg_total, on='Date_Day')
+        final_daily = final_daily.rename(columns={'Date_Day': 'Date'})
+        final_daily['Date'] = pd.to_datetime(final_daily['Date'])
         
-        daily_grp = daily_grp.rename(columns={'Date_Day': 'Date'})
-        daily_grp['Date'] = pd.to_datetime(daily_grp['Date'])
-        
-        return daily_grp
+        # Calcolo Daily_Load totale
+        cols_load = [c for c in final_daily.columns if 'Load_' in c]
+        final_daily['Daily_Load'] = final_daily[cols_load].sum(axis=1)
+
+        return final_daily
 
     except Exception as e:
         st.error(f"Errore file Attività: {e}")
@@ -138,11 +154,16 @@ def parse_garmin_activities(uploaded_file):
 
 # --- GESTIONE DB ---
 def load_db():
-    cols = ['Date', 'rMSSD', 'RHR', 'Sleep', 'Feel', 'Status', 'Daily_Load', 'Daily_Dist', 'Daily_TrainTime']
+    # Aggiunte colonne specifiche per categorie
+    cols = ['Date', 'rMSSD', 'RHR', 'Sleep', 'Feel', 'Status', 
+            'Daily_Load', 'Load_Corsa', 'Load_Bici', 'Load_Altro', 
+            'Daily_Dist', 'Daily_TrainTime']
+    
     if os.path.exists(DB_FILE):
         df = pd.read_csv(DB_FILE, parse_dates=['Date'])
         for col in cols: 
-            if col not in df.columns: df[col] = np.nan
+            if col not in df.columns: 
+                df[col] = 0.0 if 'Load_' in col else np.nan
         return df
     else: return pd.DataFrame(columns=cols)
 
@@ -164,13 +185,10 @@ def recalculate_status(df):
         base_rmssd = history['rMSSD'].mean()
         rmssd = row['rMSSD']
         
-        # Logica Semaforo
-        if rmssd < base_rmssd * 0.85: 
-            new_statuses.append("🔴 RIPOSO")
+        if rmssd < base_rmssd * 0.85: new_statuses.append("🔴 RIPOSO")
         elif rmssd < base_rmssd * 0.95 or (pd.notna(row['Feel']) and row['Feel'] < 6):
             new_statuses.append("🟡 CAUTELA")
-        else:
-            new_statuses.append("🟢 GO")
+        else: new_statuses.append("🟢 GO")
             
     df['Status'] = new_statuses
     return df
@@ -188,6 +206,10 @@ def update_db_generic(new_df, merge_cols):
         if current_db[mask].empty:
             new_entry = {k: np.nan for k in current_db.columns if k not in ['Date', 'Date_Day']}
             new_entry['Date'] = row['Date']
+            # Default 0 per i load breakdown se non presenti
+            for c in ['Load_Corsa', 'Load_Bici', 'Load_Altro']:
+                new_entry[c] = 0.0
+                
             for c in merge_cols: 
                 if c in row: new_entry[c] = row[c]
             current_db = pd.concat([current_db, pd.DataFrame([new_entry])], ignore_index=True)
@@ -217,7 +239,7 @@ with st.sidebar:
                 if r: data.append({'Date': dt, 'rMSSD': r, 'RHR': h})
         if data:
             n, u = update_db_generic(pd.DataFrame(data), ['rMSSD', 'RHR'])
-            st.success(f"HRV: {n} nuovi, {u} agg.")
+            st.success(f"HRV: {n} new, {u} upd.")
             st.rerun()
 
     st.header("🌙 2. Sonno")
@@ -226,7 +248,7 @@ with st.sidebar:
         df_s = parse_garmin_sleep(f_sleep)
         if not df_s.empty:
             n, u = update_db_generic(df_s, ['Sleep', 'Feel'])
-            st.success(f"Sonno: {n} nuovi, {u} agg.")
+            st.success(f"Sonno: {n} new, {u} upd.")
             st.rerun()
 
     st.header("🏋️ 3. Attività")
@@ -234,9 +256,14 @@ with st.sidebar:
     if f_act and st.button("Carica Attività"):
         df_a = parse_garmin_activities(f_act)
         if not df_a.empty:
-            df_a = df_a.rename(columns={'Mins': 'Daily_TrainTime', 'Load_Score': 'Daily_Load', 'Dist_km': 'Daily_Dist'})
-            n, u = update_db_generic(df_a, ['Daily_Load', 'Daily_TrainTime', 'Daily_Dist'])
-            st.success(f"Attività: {n} nuovi, {u} agg.")
+            # Assicuriamoci che tutte le colonne load esistano
+            for c in ['Load_Corsa', 'Load_Bici', 'Load_Altro']:
+                if c not in df_a.columns: df_a[c] = 0.0
+                
+            cols_to_upd = ['Daily_Load', 'Load_Corsa', 'Load_Bici', 'Load_Altro', 
+                           'Daily_Dist', 'Daily_TrainTime']
+            n, u = update_db_generic(df_a, cols_to_upd)
+            st.success(f"Attività: {n} new, {u} upd.")
             st.rerun()
 
 # --- DASHBOARD ---
@@ -244,46 +271,88 @@ df = load_db()
 
 if not df.empty:
     df = df.sort_values('Date')
+    # Calcolo medie mobili per i grafici
+    df['rMSSD_7d'] = df['rMSSD'].rolling(window=7, min_periods=1).mean()
+    
     last = df.iloc[-1]
     
     st.subheader(f"📊 Report: {last['Date'].strftime('%d/%m/%Y')}")
     
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("rMSSD", f"{last['rMSSD']} ms", delta_color="normal")
-    
-    # Tooltip spiegazione carico
-    load_val = int(last['Daily_Load']) if pd.notna(last['Daily_Load']) else "--"
-    k2.metric("Impact Load", load_val, help="TSS normalizzato + penalità oraria serale")
-    
+    k1.metric("rMSSD", f"{last['rMSSD']} ms", f"{last['rMSSD'] - last['rMSSD_7d']:.1f} vs Avg")
+    k2.metric("Load", int(last['Daily_Load']) if pd.notna(last['Daily_Load']) else "--")
     k3.metric("Sonno", f"{last['Sleep']} h")
     k4.metric("Status", last['Status'])
 
     st.divider()
 
-    t1, t2, t3 = st.tabs(["⚡ Carico vs HRV", "🌙 Recupero", "📝 Dati"])
+    t1, t2, t3 = st.tabs(["⚡ HRV & Carico", "🌙 Recupero", "📝 Dati"])
     
     with t1:
-        st.markdown("#### Stress vs Recupero")
-        st.caption("Barre: Carico Impattante (tiene conto di orario e tipo sport). Linea: HRV.")
+        # GRAFICO 1: CARICO PER TIPO ATTIVITA' (STACKED)
+        st.markdown("##### 🏋️ Carico di Lavoro (Colori per Sport)")
         
-        # Grafico Carico vs HRV
-        chart_df = df.set_index('Date').copy()
+        # Prepariamo dati per Altair (formato lungo per i colori)
+        chart_data = df.copy()
+        # Rinominiamo per legenda pulita
+        chart_data = chart_data.rename(columns={
+            'Load_Corsa': 'Corsa', 
+            'Load_Bici': 'Bici', 
+            'Load_Altro': 'Altro'
+        })
         
-        # Normalizziamo per visualizzazione su stesso asse (Opzionale, ma aiuta)
-        # Qui usiamo due grafici sovrapposti con assi indipendenti di Streamlit (limitati)
-        # O colonne affiancate
-        c1, c2 = st.columns([3, 1])
-        with c1:
-            st.markdown("**Carico Giornaliero (Barre)**")
-            st.bar_chart(chart_df['Daily_Load'], color="#800080")
-        with c2:
-            st.markdown("**Andamento rMSSD**")
-            st.line_chart(chart_df['rMSSD'], color="#0000FF")
+        base = alt.Chart(chart_data).encode(x='Date:T')
+        
+        # Trasformiamo in formato long per lo stacked chart
+        melted_load = chart_data.melt(
+            id_vars=['Date'], 
+            value_vars=['Corsa', 'Bici', 'Altro'],
+            var_name='Sport', 
+            value_name='Load'
+        )
+        
+        bars = alt.Chart(melted_load).mark_bar().encode(
+            x=alt.X('Date:T', axis=alt.Axis(format='%d/%m')),
+            y=alt.Y('Load:Q', title='Impact Load'),
+            color=alt.Color('Sport:N', scale=alt.Scale(
+                domain=['Corsa', 'Bici', 'Altro'],
+                range=['#2ca02c', '#9467bd', '#7f7f7f']  # Verde, Viola, Grigio
+            )),
+            tooltip=['Date:T', 'Sport', 'Load']
+        ).properties(height=250)
+        
+        st.altair_chart(bars, use_container_width=True)
+        
+        # GRAFICO 2: HRV CON MEDIA MOBILE
+        st.markdown("##### 🫀 Variabilità Cardiaca (rMSSD vs Baseline)")
+        
+        line_hrv = base.mark_line(point=True, color='#1f77b4').encode(
+            y=alt.Y('rMSSD:Q', scale=alt.Scale(zero=False), title='rMSSD (ms)'),
+            tooltip=['Date', 'rMSSD']
+        )
+        
+        line_avg = base.mark_line(strokeDash=[5, 5], color='orange').encode(
+            y='rMSSD_7d:Q'
+        )
+        
+        chart_hrv = (line_hrv + line_avg).properties(height=300)
+        st.altair_chart(chart_hrv, use_container_width=True)
+
+        # GRAFICO 3: BATTITI A RIPOSO (Opzionale, piccolo sotto)
+        with st.expander("Vedi andamento Battiti a Riposo (RHR)"):
+            chart_rhr = base.mark_line(color='red').encode(
+                y=alt.Y('RHR:Q', scale=alt.Scale(zero=False), title='RHR (bpm)')
+            ).properties(height=200)
+            st.altair_chart(chart_rhr, use_container_width=True)
 
     with t2:
         c_s1, c_s2 = st.columns(2)
-        with c_s1: st.bar_chart(df.set_index('Date')['Sleep'], color="#2E8B57")
-        with c_s2: st.line_chart(df.set_index('Date')['Feel'], color="#FFA500")
+        with c_s1: 
+            st.markdown("**Quantità Sonno**")
+            st.bar_chart(df.set_index('Date')['Sleep'], color="#2E8B57")
+        with c_s2: 
+            st.markdown("**Qualità (Feel)**")
+            st.line_chart(df.set_index('Date')['Feel'], color="#FFA500")
 
     with t3:
         st.dataframe(df.sort_values('Date', ascending=False))
