@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="HRV Engineer Dashboard", layout="wide", page_icon="🫀")
 
 st.title("🫀 HRV Engineer Dashboard")
-st.markdown("### Monitoraggio Ingegneristico: Carico Reale & Cronobiologia")
+st.markdown("### Monitoraggio Ingegneristico: Carico, Recupero & Fisiologia")
 
 DB_FILE = 'hrv_database.csv'
 
@@ -61,14 +61,13 @@ def parse_garmin_sleep(uploaded_file):
         return df[['Date', 'Sleep_Hours', 'Feel_Score']]
     except: return pd.DataFrame()
 
-# --- 3. PARSING ATTIVITÀ (CATEGORIE + AGGREGAZIONE) ---
+# --- 3. PARSING ATTIVITÀ ---
 def parse_garmin_activities(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
         df['Data'] = pd.to_datetime(df['Data'])
         df['Date_Day'] = df['Data'].dt.date
         
-        # Helper Numerici
         def clean_num(x):
             if pd.isna(x): return 0.0
             return float(str(x).replace(',', ''))
@@ -88,7 +87,7 @@ def parse_garmin_activities(uploaded_file):
         df['Dist_km'] = df['Distanza'].apply(clean_num)
         df['Hour'] = df['Data'].dt.hour
 
-        # Categorizzazione
+        # Categorizzazione (IMPORTANTE PER I COLORI)
         def get_category(s):
             s = s.lower()
             if 'corsa' in s: return 'Load_Corsa'
@@ -97,9 +96,8 @@ def parse_garmin_activities(uploaded_file):
 
         df['Category'] = df['Type_Raw'].apply(get_category)
 
-        # CALCOLO LOAD
+        # Calcolo Load
         def calculate_load(row):
-            # A. Base Load
             base_load = 0
             if row['TSS'] > 10:
                 base_load = row['TSS']
@@ -107,13 +105,11 @@ def parse_garmin_activities(uploaded_file):
                 te_val = row['TE'] if row['TE'] > 0 else 2.5
                 base_load = (row['Mins'] * te_val) / 3.0
             
-            # B. Moltiplicatore Forza
             act_type = row['Type_Raw'].lower()
             activity_mult = 1.0
             if any(x in act_type for x in ['forza', 'palestra', 'pesi', 'crossfit']):
                 activity_mult = 1.5 
             
-            # C. Moltiplicatore Orario
             time_mult = 1.0
             if row['Hour'] >= 21: time_mult = 1.20
             elif row['Hour'] >= 18: time_mult = 1.10
@@ -122,7 +118,7 @@ def parse_garmin_activities(uploaded_file):
 
         df['Load_Score'] = df.apply(calculate_load, axis=1)
 
-        # Pivot per Load separati (Somma se ci sono più attività dello stesso tipo nello stesso giorno)
+        # Pivot
         pivot_df = df.pivot_table(
             index='Date_Day', 
             columns='Category', 
@@ -131,7 +127,6 @@ def parse_garmin_activities(uploaded_file):
             fill_value=0
         ).reset_index()
 
-        # Aggregazione totali Distanza e Tempo (Somma tutto quello che c'è nel file)
         agg_total = df.groupby('Date_Day').agg({
             'Dist_km': 'sum',
             'Mins': 'sum'
@@ -147,7 +142,7 @@ def parse_garmin_activities(uploaded_file):
         st.error(f"Errore file Attività: {e}")
         return pd.DataFrame()
 
-# --- GESTIONE DB (UPDATE INTELLIGENTE) ---
+# --- GESTIONE DB ---
 def load_db():
     cols = ['Date', 'rMSSD', 'RHR', 'Sleep', 'Feel', 'Status', 
             'Daily_Load', 'Load_Corsa', 'Load_Bici', 'Load_Altro', 
@@ -188,12 +183,6 @@ def recalculate_status(df):
     return df
 
 def update_db_generic(new_df, merge_cols):
-    """
-    Logica di Update:
-    - Se la riga non esiste: Crea nuova.
-    - Se esiste: Aggiorna SOLO le colonne che nel nuovo file hanno dati (>0 per i Load).
-      Questo permette di caricare il file 'Corsa' e poi il file 'Bici' senza cancellarsi a vicenda.
-    """
     current_db = load_db()
     current_db['Date'] = pd.to_datetime(current_db['Date'])
     current_db['Date_Day'] = current_db['Date'].dt.date
@@ -206,50 +195,24 @@ def update_db_generic(new_df, merge_cols):
         mask = current_db['Date_Day'] == row['Date_Day']
         
         if current_db[mask].empty:
-            # NUOVA DATA
             new_entry = {k: np.nan for k in current_db.columns if k not in ['Date', 'Date_Day']}
             new_entry['Date'] = row['Date']
-            # Default a 0 per i load
             for c in ['Load_Corsa', 'Load_Bici', 'Load_Altro']: new_entry[c] = 0.0
-            
             for c in merge_cols: 
                 if c in row: new_entry[c] = row[c]
-                
             current_db = pd.concat([current_db, pd.DataFrame([new_entry])], ignore_index=True)
             current_db['Date_Day'] = current_db['Date'].dt.date
             cnt_new += 1
         else:
-            # AGGIORNAMENTO ESISTENTE
             idx = current_db[mask].index[0]
             for c in merge_cols:
                 if c in row and pd.notna(row[c]):
-                    # Logica speciale per i Load: sovrascrivi solo se c'è un valore positivo nel nuovo file
-                    # o se non è una colonna di carico.
                     if 'Load_' in c:
-                        if row[c] > 0: 
-                            current_db.at[idx, c] = row[c]
+                        if row[c] > 0: current_db.at[idx, c] = row[c]
                     else:
-                        # Per le altre colonne (es. Tempo Totale), qui facciamo una somma incrementale?
-                        # Per semplicità, Distanza e Tempo totali li aggiorniamo sommando se provengono da file diversi
-                        if c in ['Daily_Dist', 'Daily_TrainTime']:
-                             current_val = current_db.at[idx, c]
-                             if pd.isna(current_val): current_val = 0
-                             # Qui c'è un rischio: se ricarichi lo STESSO file, somma due volte.
-                             # Assumiamo sovrascrittura se il valore è significativamente diverso, 
-                             # ma per Brick con file diversi è meglio sommare? 
-                             # Strategia sicura: Sovrascrivi, l'utente dovrebbe caricare un file master.
-                             # MA, dato che hai file separati, facciamo così:
-                             # Se è 'Daily_Dist', sommiamo solo se stiamo caricando una categoria diversa? Complesso.
-                             # Semplifichiamo: I Load sono separati (Corsa/Bici), quindi sicuri.
-                             # Distanza e Tempo totale rischiano di essere sovrascritti.
-                             # Proposta: Lasciamo sovrascrittura per semplicità sui totali, 
-                             # ma corretta sui Load specifici.
-                             pass 
-                        
                         current_db.at[idx, c] = row[c]
             cnt_upd += 1
             
-    # Ricalcolo colonna somma totale Daily_Load
     cols_load = [c for c in ['Load_Corsa', 'Load_Bici', 'Load_Altro'] if c in current_db.columns]
     current_db['Daily_Load'] = current_db[cols_load].sum(axis=1)
 
@@ -271,7 +234,7 @@ with st.sidebar:
                 if r: data.append({'Date': dt, 'rMSSD': r, 'RHR': h})
         if data:
             n, u = update_db_generic(pd.DataFrame(data), ['rMSSD', 'RHR'])
-            st.success(f"HRV: {n} new, {u} upd.")
+            st.success(f"HRV: {n} nuovi, {u} agg.")
             st.rerun()
 
     st.header("🌙 2. Sonno")
@@ -280,13 +243,12 @@ with st.sidebar:
         df_s = parse_garmin_sleep(f_sleep)
         if not df_s.empty:
             n, u = update_db_generic(df_s, ['Sleep', 'Feel'])
-            st.success(f"Sonno: {n} new, {u} upd.")
+            st.success(f"Sonno: {n} nuovi, {u} agg.")
             st.rerun()
 
     st.header("🏋️ 3. Attività")
-    f_act = st.file_uploader("Activities.csv (Anche multipli)", type=['csv'], accept_multiple_files=True)
+    f_act = st.file_uploader("Activities.csv", type=['csv'], accept_multiple_files=True)
     if f_act and st.button("Carica Attività"):
-        # Gestione caricamento multiplo (es. file Corsa + file Bici insieme)
         master_df = pd.DataFrame()
         for f in f_act:
             df_temp = parse_garmin_activities(f)
@@ -294,18 +256,13 @@ with st.sidebar:
                 master_df = pd.concat([master_df, df_temp])
         
         if not master_df.empty:
-            # Se carichi più file insieme, raggruppiamo prima dell'update
-            # Così sommiamo i load di file diversi prima di inviare al DB
             master_df = master_df.groupby('Date').sum().reset_index()
-            
-            # Assicuriamoci che tutte le colonne load esistano
             for c in ['Load_Corsa', 'Load_Bici', 'Load_Altro']:
                 if c not in master_df.columns: master_df[c] = 0.0
                 
-            cols_to_upd = ['Load_Corsa', 'Load_Bici', 'Load_Altro', 
-                           'Daily_Dist', 'Daily_TrainTime']
+            cols_to_upd = ['Load_Corsa', 'Load_Bici', 'Load_Altro', 'Daily_Dist', 'Daily_TrainTime']
             n, u = update_db_generic(master_df, cols_to_upd)
-            st.success(f"Attività: {n} new, {u} upd.")
+            st.success(f"Attività: {n} nuovi, {u} agg.")
             st.rerun()
 
 # --- DASHBOARD ---
@@ -326,49 +283,62 @@ if not df.empty:
 
     st.divider()
 
-    t1, t2, t3 = st.tabs(["⚡ HRV & Carico", "🌙 Recupero", "📝 Dati"])
+    # --- IL SUPER GRAFICO ---
+    st.markdown("### 🧩 Quadro Completo (Carico + HRV + Sonno)")
     
-    with t1:
-        st.markdown("##### 🏋️ Carico Multisport & Risposta Cardiaca")
-        
-        # 1. Grafico Carico (Stacked)
-        chart_data = df.copy()
-        chart_data = chart_data.rename(columns={'Load_Corsa': 'Corsa', 'Load_Bici': 'Bici', 'Load_Altro': 'Altro'})
-        
-        melted_load = chart_data.melt(
-            id_vars=['Date'], 
-            value_vars=['Corsa', 'Bici', 'Altro'],
-            var_name='Sport', 
-            value_name='Load'
-        )
-        
-        base = alt.Chart(chart_data).encode(x='Date:T')
-        
-        bars = alt.Chart(melted_load).mark_bar().encode(
-            x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title='Data')),
-            y=alt.Y('Load:Q', title='Impact Load'),
-            color=alt.Color('Sport:N', scale=alt.Scale(range=['#2ca02c', '#9467bd', '#7f7f7f'])),
-            tooltip=['Date:T', 'Sport', 'Load']
-        ).properties(height=300)
-        
-        st.altair_chart(bars, use_container_width=True)
-        
-        # 2. Grafico HRV Large
-        st.markdown("##### 🫀 Variabilità Cardiaca (rMSSD)")
-        line_hrv = base.mark_line(point=True, color='#1f77b4', strokeWidth=3).encode(
-            y=alt.Y('rMSSD:Q', scale=alt.Scale(zero=False, padding=10), title='rMSSD (ms)'),
-            tooltip=['Date', 'rMSSD']
-        )
-        line_avg = base.mark_line(strokeDash=[5, 5], color='orange').encode(y='rMSSD_7d:Q')
-        
-        st.altair_chart((line_hrv + line_avg).properties(height=350), use_container_width=True)
+    # Preparazione Dati per Altair
+    chart_data = df.copy()
+    chart_data = chart_data.rename(columns={'Load_Corsa': 'Corsa', 'Load_Bici': 'Bici', 'Load_Altro': 'Altro'})
+    
+    # 1. GRAFICO SUPERIORE: Carico (Barre Stacked) + HRV (Linea)
+    base = alt.Chart(chart_data).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title='')))
 
-    with t2:
-        c1, c2 = st.columns(2)
-        with c1: st.bar_chart(df.set_index('Date')['Sleep'], color="#2E8B57")
-        with c2: st.line_chart(df.set_index('Date')['Feel'], color="#FFA500")
+    # Barre Stacked (Load)
+    melted_load = chart_data.melt(
+        id_vars=['Date'], 
+        value_vars=['Corsa', 'Bici', 'Altro'],
+        var_name='Sport', 
+        value_name='Load'
+    )
+    
+    bars = alt.Chart(melted_load).mark_bar().encode(
+        x='Date:T',
+        y=alt.Y('Load:Q', title='Impact Load'),
+        color=alt.Color('Sport:N', scale=alt.Scale(
+            domain=['Corsa', 'Bici', 'Altro'],
+            range=['#d62728', '#1f77b4', '#7f7f7f'] # ROSSO, BLU, GRIGIO
+        )),
+        tooltip=['Date:T', 'Sport', 'Load']
+    )
 
-    with t3:
+    # Linea HRV (Asse Destro)
+    line_hrv = base.mark_line(color='black', strokeWidth=3).encode(
+        y=alt.Y('rMSSD:Q', title='rMSSD (ms)', scale=alt.Scale(zero=False)),
+        tooltip=['Date', 'rMSSD']
+    )
+    
+    # Combinazione (Dual Axis)
+    upper_chart = alt.layer(bars, line_hrv).resolve_scale(y='independent').properties(height=350)
+
+    # 2. GRAFICO INFERIORE: Sonno (Barre) + Feel (Linea)
+    bars_sleep = base.mark_bar(color='#2ca02c', opacity=0.5).encode(
+        y=alt.Y('Sleep:Q', title='Ore Sonno', scale=alt.Scale(domain=[4, 12])),
+        tooltip=['Date', 'Sleep']
+    )
+    
+    line_feel = base.mark_line(color='#ff7f0e', point=True).encode(
+        y=alt.Y('Feel:Q', title='Feel (1-10)', scale=alt.Scale(domain=[1, 10])),
+        tooltip=['Date', 'Feel']
+    )
+    
+    lower_chart = alt.layer(bars_sleep, line_feel).resolve_scale(y='independent').properties(height=150)
+
+    # 3. UNIONE VERTICALE
+    final_chart = alt.vconcat(upper_chart, lower_chart).resolve_scale(x='shared')
+    
+    st.altair_chart(final_chart, use_container_width=True)
+
+    with st.expander("📝 Visualizza Dati Tabellari"):
         st.dataframe(df.sort_values('Date', ascending=False))
 
 else:
