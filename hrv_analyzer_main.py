@@ -571,19 +571,30 @@ if not df.empty:
             m2.metric("LF (Stress/BP)", f"{int(last['LF'])}", delta_color="inverse") # Se sale troppo è male
             m3.metric("HF (Recupero)", f"{int(last['HF'])}")
             
-            # Grafico ad Area Stacked (HF vs LF)
-            spectra_data = df_viz[['Date', 'LF', 'HF']].melt('Date', var_name='Band', value_name='Power')
-            area_spectra = alt.Chart(spectra_data).mark_area(opacity=0.6).encode(
-                x='Date:T',
-                y=alt.Y('Power:Q', stack='normalize', title='Dominanza %'),
-                color=alt.Color('Band:N', scale=alt.Scale(domain=['LF', 'HF'], range=['#FF7043', '#42A5F5'])),
-                tooltip=['Date', 'Band', 'Power']
-            ).properties(height=300)
+            # --- CODICE GRAFICO CORRETTO ---
+            # Filtriamo solo le righe dove LF e HF sono > 0 per evitare errori grafici
+            valid_spectra = df_viz[(df_viz['LF'] > 0) & (df_viz['HF'] > 0)].copy()
             
-            st.altair_chart(area_spectra, use_container_width=True)
-            st.caption("🟥 Arancione: Simpatico (LF) | 🟦 Blu: Parasimpatico (HF). A riposo vorremmo vedere più Blu.")
-        else:
-            st.warning("Dati spettrali non disponibili (intervalli RR insufficienti nel file).")
+            if not valid_spectra.empty:
+                spectra_data = valid_spectra[['Date', 'LF', 'HF']].melt('Date', var_name='Band', value_name='Power')
+                
+                area_spectra = alt.Chart(spectra_data).mark_area(opacity=0.6).encode(
+                    x=alt.X('Date:T', axis=alt.Axis(format='%d/%m')),
+                    y=alt.Y('Power:Q', stack='normalize', title='Dominanza % (Normalizzata)'),
+                    color=alt.Color('Band:N', 
+                                    scale=alt.Scale(domain=['LF', 'HF'], range=['#FF7043', '#42A5F5']),
+                                    legend=alt.Legend(title="Banda Frequenza")),
+                    tooltip=[
+                        alt.Tooltip('Date:T', format='%d %B'), 
+                        alt.Tooltip('Band', title='Tipo'), 
+                        alt.Tooltip('Power', format='.0f', title='Potenza (ms²)')
+                    ]
+                ).properties(height=300)
+                
+                st.altair_chart(area_spectra, use_container_width=True)
+                st.caption("🟥 Arancione: Simpatico (LF) | 🟦 Blu: Parasimpatico (HF). A riposo vorremmo vedere più Blu.")
+            else:
+                st.warning("Ci sono dati HRV, ma il calcolo spettrale ha prodotto zeri. Verifica che i file .txt abbiano abbastanza battiti (>300).")
 
         st.divider()
 
