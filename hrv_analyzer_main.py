@@ -364,6 +364,27 @@ if not df.empty:
     df['Status_Color'] = df['Status'].apply(get_status_color)
     
     last = df.iloc[-1]
+
+    # --- INIZIO MODIFICA: FILTRO INTELLIGENTE DATA ---
+    # Troviamo la prima data in cui c'è l'HRV
+    first_hrv = df[df['rMSSD'] > 0]['Date'].min()
+    # Troviamo la prima data in cui c'è il Sonno
+    first_sleep = df[df['Sleep'] > 0]['Date'].min()
+    
+    # Calcoliamo la data di partenza (Intersezione)
+    # Se esistono entrambi, prendiamo la data più recente tra le due partenze
+    if pd.notna(first_hrv) and pd.notna(first_sleep):
+        start_date = max(first_hrv, first_sleep)
+    elif pd.notna(first_hrv):
+        start_date = first_hrv
+    elif pd.notna(first_sleep):
+        start_date = first_sleep
+    else:
+        start_date = df['Date'].min()
+        
+    # Creiamo il dataset filtrato SOLO per la visualizzazione
+    df_viz = df[df['Date'] >= start_date].copy()
+    # --- FINE MODIFICA ---
     
     # --- HEADER & KPI ---
     st.subheader(f"📊 Report: {last['Date'].strftime('%d %B %Y')}")
@@ -410,7 +431,7 @@ if not df.empty:
     
     with t1:
         # Prep Data
-        chart_data = df.copy()
+        chart_data = df_viz.copy()
         chart_data = chart_data.rename(columns={'Load_Corsa': 'Corsa', 'Load_Bici': 'Bici', 'Load_Altro': 'Altro'})
         
         base = alt.Chart(chart_data).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title=None, grid=False, domain=False)))
@@ -455,7 +476,7 @@ if not df.empty:
         # GRAFICO SONNO (Area Sfumata)
         st.markdown("#### Qualità del Sonno")
         
-        base_s = alt.Chart(df).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title=None, grid=False)))
+        base_s = alt.Chart(df_viz).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title=None, grid=False)))
         
         area = base_s.mark_area(
             line={'color':'#66BB6A'},
@@ -499,7 +520,7 @@ if not df.empty:
         c4.metric("LF/HF Ratio", f"{last['LF_HF']}")
         
         st.markdown("#### Instabilità (Coefficiente di Variazione)")
-        cv_chart = alt.Chart(df).mark_area(color='#B39DDB', opacity=0.3, line={'color':'#673AB7'}).encode(
+        cv_chart = alt.Chart(df_viz).mark_area(color='#B39DDB', opacity=0.3, line={'color':'#673AB7'}).encode(
             x='Date:T',
             y=alt.Y('CV_7d:Q', title='CV %'),
             tooltip=['Date', 'CV_7d']
