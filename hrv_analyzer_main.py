@@ -39,21 +39,21 @@ def parse_rr_file_advanced(file_content):
         # --- TIME DOMAIN ---
         rmssd = np.sqrt(np.mean(diffs**2))
         ln_rmssd = np.log(rmssd) if rmssd > 0 else 0
-        sdnn = np.std(rr, ddof=1) # Standard deviation of NN intervals
+        sdnn = np.std(rr, ddof=1)
         mean_rr = np.mean(rr)
         rhr = 60000 / mean_rr
         pnn50 = (np.sum(np.abs(diffs) > 50) / len(diffs)) * 100
         
-        # --- FREQUENCY DOMAIN (Opzionale) ---
+        # --- FREQUENCY DOMAIN ---
         lf_power, hf_power, total_power, lf_hf = 0, 0, 0, 0
         
         if SCIPY_AVAILABLE and len(rr) > 30:
             try:
-                # 1. Creazione asse tempi (cumulativo)
+                # 1. Asse tempi cumulativo
                 t_rr = np.cumsum(rr) / 1000.0
                 t_rr = t_rr - t_rr[0]
                 
-                # 2. Interpolazione a 4Hz (standard per HRV)
+                # 2. Interpolazione 4Hz
                 fs = 4.0
                 steps = np.arange(0, t_rr[-1], 1/fs)
                 f_interp = interpolate.interp1d(t_rr, rr, kind='cubic', fill_value="extrapolate")
@@ -66,9 +66,6 @@ def parse_rr_file_advanced(file_content):
                 freqs, psd = signal.welch(rr_detrend, fs=fs, nperseg=min(len(rr_detrend), 256))
                 
                 # 5. Integrazione Bande
-                # VLF: 0.0033 - 0.04 (Ignoriamo per short term)
-                # LF: 0.04 - 0.15 Hz
-                # HF: 0.15 - 0.40 Hz
                 lf_band = (freqs >= 0.04) & (freqs < 0.15)
                 hf_band = (freqs >= 0.15) & (freqs < 0.40)
                 
@@ -78,9 +75,7 @@ def parse_rr_file_advanced(file_content):
                 
                 lf_hf = lf_power / hf_power if hf_power > 0 else 0
                 
-            except Exception as e:
-                # Fallback se fallisce il calcolo spettrale
-                pass
+            except Exception: pass
         
         return {
             'rMSSD': round(rmssd, 2),
@@ -93,7 +88,6 @@ def parse_rr_file_advanced(file_content):
             'TotalPower': round(total_power, 0),
             'LF_HF': round(lf_hf, 2)
         }
-        
     except Exception: return None
 
 def extract_date_from_filename(filename):
@@ -186,16 +180,13 @@ def parse_garmin_activities(uploaded_file):
         final_daily['Date'] = pd.to_datetime(final_daily['Date'])
         
         return final_daily
-
     except Exception: return pd.DataFrame()
 
 # --- GESTIONE DB ---
 def load_db():
-    # Elenco completo colonne incluse le nuove metriche avanzate
     cols = ['Date', 'rMSSD', 'RHR', 'Sleep', 'Feel', 'Status', 
             'Daily_Load', 'Load_Corsa', 'Load_Bici', 'Load_Altro', 
             'Daily_Dist', 'Daily_TrainTime',
-            # Nuove metriche
             'ln_rMSSD', 'SDNN', 'PNN50', 'LF', 'HF', 'TotalPower', 'LF_HF']
     
     if os.path.exists(DB_FILE):
@@ -310,6 +301,32 @@ with st.sidebar:
             st.success(f"Attività: {n} nuovi, {u} agg.")
             st.rerun()
 
+    # --- NUOVO: GESTIONE DATABASE ---
+    st.markdown("---")
+    st.header("⚙️ Gestione DB")
+    
+    # Inizializza stato conferma
+    if 'confirm_reset' not in st.session_state:
+        st.session_state.confirm_reset = False
+
+    if st.button("🗑️ Pulisci Database"):
+        st.session_state.confirm_reset = True
+
+    if st.session_state.confirm_reset:
+        st.warning("⚠️ Azione irreversibile. Sicuro?")
+        col_yes, col_no = st.columns(2)
+        with col_yes:
+            if st.button("✅ Conferma"):
+                if os.path.exists(DB_FILE):
+                    os.remove(DB_FILE)
+                    st.success("Database cancellato.")
+                st.session_state.confirm_reset = False
+                st.rerun()
+        with col_no:
+            if st.button("❌ Annulla"):
+                st.session_state.confirm_reset = False
+                st.rerun()
+
 # --- DASHBOARD ---
 df = load_db()
 
@@ -317,9 +334,6 @@ if not df.empty:
     df = df.sort_values('Date')
     df['rMSSD_7d'] = df['rMSSD'].rolling(window=7, min_periods=1).mean()
     df['rMSSD_Response'] = df['rMSSD'].shift(-1)
-    
-    # Calcolo Coefficiente di Variazione (CV%) su 7 giorni
-    # CV = (Deviazione Standard / Media) * 100
     df['CV_7d'] = (df['rMSSD'].rolling(window=7, min_periods=3).std() / df['rMSSD'].rolling(window=7, min_periods=3).mean()) * 100
     
     last = df.iloc[-1]
@@ -347,14 +361,11 @@ if not df.empty:
             y_axis_hrv = 'rMSSD_Response'
             color_hrv = '#d62728'
 
-    # --- TABS ---
     t1, t2, t3, t4 = st.tabs(["⚡ HRV & Carico", "🌙 Recupero", "📝 Dati", "🔬 Laboratorio HRV"])
     
     with t1:
-        # SUPER GRAFICO
         chart_data = df.copy()
         chart_data = chart_data.rename(columns={'Load_Corsa': 'Corsa', 'Load_Bici': 'Bici', 'Load_Altro': 'Altro'})
-        
         base = alt.Chart(chart_data).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title='')))
         
         melted_load = chart_data.melt(id_vars=['Date'], value_vars=['Corsa', 'Bici', 'Altro'], var_name='Sport', value_name='Load')
@@ -389,42 +400,28 @@ if not df.empty:
 
     with t4:
         st.markdown("### 🔬 Analisi Statistica Avanzata")
-        st.caption("Dati grezzi calcolati dagli intervalli RR. Utile per capire la natura dello stress (Simpatico vs Parasimpatico).")
-        
-        # Row 1: Metriche Base
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-        r1c1.metric("ln(rMSSD)", f"{last['ln_rMSSD']}", help="Logaritmo di rMSSD. È spesso usato come 'Punteggio HRV' (su scala 1-10 o 1-100 moltiplicato). Più stabile del rMSSD grezzo.")
-        r1c2.metric("PNN50 %", f"{last['PNN50']}%", help="% di battiti che variano >50ms dal precedente. Indica forte attività parasimpatica.")
-        r1c3.metric("SDNN", f"{last['SDNN']} ms", help="Standard Deviation NN. Indica la 'Potenza Totale' del sistema. Include sia stress che recupero.")
-        r1c4.metric("CV (7gg)", f"{last['CV_7d']:.1f}%", help="Coefficiente di Variazione. <5% = Stabile. >10% = Instabile/Stress Acuto. Indica quanto il tuo HRV sta saltando su e giù.")
+        r1c1.metric("ln(rMSSD)", f"{last['ln_rMSSD']}", help="Logaritmo di rMSSD. Indice 'puro' HRV.")
+        r1c2.metric("PNN50 %", f"{last['PNN50']}%", help="% battiti >50ms diff. Parasimpatico.")
+        r1c3.metric("SDNN", f"{last['SDNN']} ms", help="Variabilità totale (Stress + Recupero).")
+        r1c4.metric("CV (7gg)", f"{last['CV_7d']:.1f}%", help="Stabilità (<5% = Stabile).")
 
         st.divider()
-
-        # Row 2: Frequency Domain (Se disponibile)
         if 'LF' in df.columns and pd.notna(last['LF']) and last['TotalPower'] > 0:
-            st.markdown("#### 📡 Analisi Spettrale (Frequency Domain)")
+            st.markdown("#### 📡 Frequency Domain")
             f1, f2, f3, f4 = st.columns(4)
-            f1.metric("Total Power", f"{int(last['TotalPower'])}", help="Energia totale dello spettro. Cala con l'età e la stanchezza cronica.")
-            f2.metric("LF (Low Freq)", f"{int(last['LF'])}", help="0.04-0.15Hz. Mix di Simpatico (Stress) e regolazione pressione. Aumenta sotto stress mentale.")
-            f3.metric("HF (High Freq)", f"{int(last['HF'])}", help="0.15-0.40Hz. Puro Parasimpatico (Vago/Respiro). Correla con rMSSD.")
-            f4.metric("Ratio LF/HF", f"{last['LF_HF']}", help="Bilanciamento. Alto (>2.0) = Dominanza Simpatica (Lotta/Fuga). Basso = Recupero.")
+            f1.metric("Total Power", f"{int(last['TotalPower'])}", help="Energia totale.")
+            f2.metric("LF", f"{int(last['LF'])}", help="Simpatico/Pressione.")
+            f3.metric("HF", f"{int(last['HF'])}", help="Parasimpatico.")
+            f4.metric("LF/HF", f"{last['LF_HF']}", help="Balance.")
         else:
-            st.info("Dati spettrali (LF/HF) non disponibili o insufficienti per l'ultima lettura.")
-
-        st.divider()
-        
-        st.markdown("#### 📉 Stabilità Fisiologica (Coefficiente di Variazione)")
-        st.caption("Il grafico mostra quanto è 'ballerino' il tuo HRV. Vogliamo che la linea stia bassa.")
-        
+            st.info("Dati spettrali non disponibili.")
+            
+        st.markdown("#### 📉 Coefficiente di Variazione")
         cv_chart = alt.Chart(df).mark_line(color='purple', point=True).encode(
-            x='Date:T',
-            y=alt.Y('CV_7d:Q', title='CV % (Rolling 7gg)'),
-            tooltip=['Date', 'CV_7d']
-        ).properties(height=300)
-        
-        # Aggiungiamo una linea di soglia (es. 10% è alto)
+            x='Date:T', y=alt.Y('CV_7d:Q', title='CV %'), tooltip=['Date', 'CV_7d']
+        ).properties(height=250)
         rule = alt.Chart(pd.DataFrame({'y': [10]})).mark_rule(color='red', strokeDash=[3,3]).encode(y='y')
-        
         st.altair_chart(cv_chart + rule, use_container_width=True)
 
 else:
