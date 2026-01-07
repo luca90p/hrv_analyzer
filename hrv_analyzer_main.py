@@ -512,23 +512,93 @@ if not df.empty:
         )
 
     with t4:
-        st.markdown("### 🔬 Metriche Avanzate")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("ln(rMSSD)", f"{last['ln_rMSSD']}")
-        c2.metric("PNN50", f"{last['PNN50']}%")
-        c3.metric("SDNN", f"{last['SDNN']}")
-        c4.metric("LF/HF Ratio", f"{last['LF_HF']}")
+        st.markdown("## 🔬 Laboratorio Analisi HRV")
         
-        st.markdown("#### Instabilità (Coefficiente di Variazione)")
-        cv_chart = alt.Chart(df_viz).mark_area(color='#B39DDB', opacity=0.3, line={'color':'#673AB7'}).encode(
-            x='Date:T',
-            y=alt.Y('CV_7d:Q', title='CV %'),
-            tooltip=['Date', 'CV_7d']
-        ).properties(height=200)
+        # --- SEZIONE 1: DOMINIO DEL TEMPO (Resilienza) ---
+        st.markdown("### 1. Resilienza Totale (SDNN)")
+        with st.expander("📘 Guida: rMSSD vs SDNN"):
+            st.markdown("""
+            * **rMSSD (Il Meccanico):** Indica l'attività parasimpatica a *breve termine*. È quanto velocemente il tuo corpo riesce a "frenare" il cuore beat-to-beat. È l'indice del recupero immediato.
+            * **SDNN (Il Serbatoio):** È la deviazione standard di *tutti* i battiti. Rappresenta la **capacità totale** del tuo sistema nervoso di rispondere agli stress. 
+                * *SDNN Alto:* Grande riserva di energia adattiva (Sei resiliente).
+                * *SDNN Basso cronico:* Rischio burnout o sovrallenamento strutturale.
+            """)
         
-        limit = alt.Chart(pd.DataFrame({'y': [10]})).mark_rule(color='#FF1744', strokeDash=[5,5]).encode(y='y')
+        c1, c2 = st.columns(2)
+        c1.metric("SDNN (Oggi)", f"{last['SDNN']} ms", help="Target > 50-100ms a seconda dell'età")
+        c2.metric("PNN50", f"{last['PNN50']}%", help="% Battiti che differiscono >50ms. Indice puro di tono vagale.")
         
-        st.altair_chart(cv_chart + limit, use_container_width=True)
+        # Grafico SDNN con linea di tendenza
+        base_sdnn = alt.Chart(df_viz).encode(x='Date:T')
+        line_sdnn = base_sdnn.mark_line(color='#AB47BC', strokeWidth=3).encode(
+            y=alt.Y('SDNN:Q', title='SDNN (ms)', scale=alt.Scale(zero=False)),
+            tooltip=['Date', 'SDNN']
+        )
+        trend_sdnn = base_sdnn.transform_regression('Date', 'SDNN', method='loess').mark_line(color='white', opacity=0.5, strokeDash=[5,5]).encode(y='SDNN:Q')
+        
+        st.altair_chart((line_sdnn + trend_sdnn).properties(height=250), use_container_width=True)
+
+        st.divider()
+
+        # --- SEZIONE 2: DOMINIO DELLA FREQUENZA (Bilanciamento) ---
+        st.markdown("### 2. Spettro di Potenza (LF vs HF)")
+        with st.expander("📘 Guida: Gas vs Freno (LF/HF)"):
+            st.markdown("""
+            L'analisi spettrale scompone il segnale cardiaco in frequenze:
+            * **LF (Low Frequency - 0.04-0.15Hz):** [Immagine del sistema nervoso simpatico] Associato al sistema **Simpatico** (Lotta o Fuga) e alla regolazione della pressione sanguigna. Se alto, sei "attivato".
+            * **HF (High Frequency - 0.15-0.4Hz):** [Immagine del sistema nervoso parasimpatico] Associato al sistema **Parasimpatico** (Riposo e Respiro). Se alto, stai recuperando.
+            * **Ratio LF/HF:** Indica il bilanciamento. 
+                * *Target:* Basso (es. 1.0 - 2.0) a riposo.
+                * *Alto (>3.0):* Stress predominante.
+            """)
+            
+        if 'LF' in df.columns and pd.notna(last['LF']):
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Power", f"{int(last['TotalPower'])} ms²", help="Energia totale del sistema.")
+            m2.metric("LF (Stress/BP)", f"{int(last['LF'])}", delta_color="inverse") # Se sale troppo è male
+            m3.metric("HF (Recupero)", f"{int(last['HF'])}")
+            
+            # Grafico ad Area Stacked (HF vs LF)
+            spectra_data = df_viz[['Date', 'LF', 'HF']].melt('Date', var_name='Band', value_name='Power')
+            area_spectra = alt.Chart(spectra_data).mark_area(opacity=0.6).encode(
+                x='Date:T',
+                y=alt.Y('Power:Q', stack='normalize', title='Dominanza %'),
+                color=alt.Color('Band:N', scale=alt.Scale(domain=['LF', 'HF'], range=['#FF7043', '#42A5F5'])),
+                tooltip=['Date', 'Band', 'Power']
+            ).properties(height=300)
+            
+            st.altair_chart(area_spectra, use_container_width=True)
+            st.caption("🟥 Arancione: Simpatico (LF) | 🟦 Blu: Parasimpatico (HF). A riposo vorremmo vedere più Blu.")
+        else:
+            st.warning("Dati spettrali non disponibili (intervalli RR insufficienti nel file).")
+
+        st.divider()
+
+        # --- SEZIONE 3: ACCOPPIAMENTO CARDIACO ---
+        st.markdown("### 3. Correlazione rMSSD vs RHR")
+        with st.expander("📘 Guida: Saturazione Parasimpatica"):
+            st.markdown("""
+            Normalmente, **rMSSD e RHR sono inversi**:
+            * rMSSD sale ⬆️ -> RHR scende ⬇️ (Buon segno: recupero).
+            * rMSSD scende ⬇️ -> RHR sale ⬆️ (Cattivo segno: stress).
+            
+            **⚠️ Il Pericolo (Saturazione):**
+            Se vedi **rMSSD basso ⬇️ E RHR basso ⬇️**, attenzione! Potrebbe essere "Saturazione Parasimpatica" o "Exhaustion". Il corpo è così stanco che non riesce nemmeno ad alzare i battiti. È un campanello d'allarme per l'overtraining.
+            """)
+        
+        # Grafico a doppio asse sincronizzato
+        base_corr = alt.Chart(df_viz).encode(x='Date:T')
+        
+        line_rmssd = base_corr.mark_line(color='#263238').encode(
+            y=alt.Y('rMSSD:Q', title='rMSSD (ms)')
+        )
+        
+        line_rhr = base_corr.mark_line(color='#d62728', strokeDash=[5,5]).encode(
+            y=alt.Y('RHR:Q', title='RHR (bpm)', scale=alt.Scale(zero=False))
+        )
+        
+        st.altair_chart(alt.layer(line_rmssd, line_rhr).resolve_scale(y='independent').properties(height=300), use_container_width=True)
+        st.caption("⚫ Linea Nera: rMSSD | 🔴 Linea Rossa Tratteggiata: Battiti a Riposo (RHR).")
 
 else:
     st.info("👋 Database vuoto. Carica i file dalla sidebar.")
