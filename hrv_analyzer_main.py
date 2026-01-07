@@ -5,7 +5,7 @@ import os
 import altair as alt
 from datetime import datetime, timedelta
 
-# Tenta l'import di scipy
+# Tenta l'import di scipy per l'analisi spettrale
 try:
     from scipy import interpolate, signal
     SCIPY_AVAILABLE = True
@@ -82,15 +82,18 @@ def extract_date_from_filename(filename):
 def parse_garmin_sleep(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
-        # Rinomina la prima colonna in Date
+        # Garmin esporta spesso la prima colonna con nomi strani, la rinominiamo in Date
         df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
         
-        # Gestione nomi colonne variabili
-        col_durata = 'Durata' if 'Durata' in df.columns else 'Tempo' # Fallback
-        col_qualita = 'Qualità'
+        # Cerchiamo la colonna durata in modo flessibile
+        col_durata = None
+        for c in df.columns:
+            if 'durata' in c.lower() or 'tempo' in c.lower():
+                col_durata = c
+                break
         
-        if col_durata not in df.columns:
-            st.error(f"Colonna durata non trovata. Colonne presenti: {df.columns.tolist()}")
+        if not col_durata:
+            st.error("Colonna durata non trovata nel file.")
             return pd.DataFrame()
 
         df['Date'] = pd.to_datetime(df['Date'])
@@ -101,33 +104,34 @@ def parse_garmin_sleep(uploaded_file):
             parts = val.split()
             if len(parts) == 2: return round(float(parts[0]) + float(parts[1])/60, 2)
             elif len(parts) == 1: 
-                # Gestisce il caso in cui c'è solo un numero (ore o minuti?)
-                # Assumiamo ore se < 24, minuti se > 24?
-                # Meglio assumere formato hh:mm se ci sono :
+                # Gestione caso "7.5" o "7:30"
                 if ':' in str(val):
                     p = str(val).split(':')
                     return round(float(p[0]) + float(p[1])/60, 2)
                 return float(parts[0])
             return 0.0
             
-        df['Sleep_Hours'] = df[col_durata].apply(clean_duration)
+        df['Sleep'] = df[col_durata].apply(clean_duration)
         
         # Mappa qualità
+        # Cerchiamo colonna qualità
+        col_qualita = 'Qualità'
+        for c in df.columns: 
+            if 'qualit' in c.lower(): col_qualita = c; break
+
         quality_map = {'Eccellente': 9, 'Buono': 8, 'Discreto': 6, 'Scarso': 4}
         if col_qualita in df.columns:
-            df['Feel_Score'] = df[col_qualita].map(quality_map).fillna(5)
+            df['Feel'] = df[col_qualita].map(quality_map).fillna(5)
         else:
-            df['Feel_Score'] = 5 # Default se manca colonna
+            df['Feel'] = 5 
             
-        # Debug: mostra cosa ha letto
-        st.caption(f"Letto file sonno: {len(df)} righe. Esempio data: {df['Date'].dt.date.iloc[0]}")
-        
-        return df[['Date', 'Sleep_Hours', 'Feel_Score']]
+        # Restituisce le colonne con i nomi corretti per il DB
+        return df[['Date', 'Sleep', 'Feel']]
     except Exception as e:
         st.error(f"Errore lettura Sonno: {e}")
         return pd.DataFrame()
 
-# --- 3. PARSING ATTIVITÀ ---
+# --- 3. PARSING ATTIVITÀ (CORRETTO) ---
 def parse_garmin_activities(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
@@ -179,11 +183,18 @@ def parse_garmin_activities(uploaded_file):
 
         df['Load_Score'] = df.apply(calculate_load, axis=1)
         
+        # Pivot per Load
         piv = df.pivot_table(index='Date_Day', columns='Category', values='Load_Score', aggfunc='sum', fill_value=0).reset_index()
+        # Totali
         agg = df.groupby('Date_Day').agg({'Dist_km': 'sum', 'Mins': 'sum'}).reset_index()
+        
         final = pd.merge(piv, agg, on='Date_Day')
         final = final.rename(columns={'Date_Day': 'Date'})
         final['Date'] = pd.to_datetime(final['Date'])
+        
+        # RINOMINA PER MATCH DB
+        final = final.rename(columns={'Dist_km': 'Daily_Dist', 'Mins': 'Daily_TrainTime'})
+        
         return final
     except: return pd.DataFrame()
 
@@ -226,7 +237,6 @@ def recalculate_status(df):
 def update_db_generic(new_df, merge_cols):
     current_db = load_db()
     
-    # Normalizzazione date
     current_db['Date'] = pd.to_datetime(current_db['Date'])
     current_db['Date_Day'] = current_db['Date'].dt.date
     new_df['Date'] = pd.to_datetime(new_df['Date'])
@@ -238,7 +248,6 @@ def update_db_generic(new_df, merge_cols):
         mask = current_db['Date_Day'] == row['Date_Day']
         
         if current_db[mask].empty:
-            # Crea
             new_entry = {k: np.nan for k in current_db.columns if k not in ['Date', 'Date_Day']}
             new_entry['Date'] = row['Date']
             for c in ['Load_Corsa', 'Load_Bici', 'Load_Altro']: new_entry[c] = 0.0
@@ -248,14 +257,15 @@ def update_db_generic(new_df, merge_cols):
             current_db['Date_Day'] = current_db['Date'].dt.date
             cnt_new += 1
         else:
-            # Aggiorna
             idx = current_db[mask].index[0]
             for c in merge_cols:
+                # Controlla se la colonna esiste nel nuovo dato e non è nulla
                 if c in row and pd.notna(row[c]):
                     if 'Load_' in c:
+                        # Per i Load sommiamo o sovrascriviamo solo se > 0
                         if row[c] > 0: current_db.at[idx, c] = row[c]
                     else:
-                        # Qui la correzione cruciale: sovrascrivi sempre se il dato c'è
+                        # Per il resto (es. Sleep, Feel) sovrascriviamo
                         current_db.at[idx, c] = row[c]
             cnt_upd += 1
             
@@ -295,7 +305,7 @@ with st.sidebar:
             st.success(f"Sonno: {n} nuovi, {u} agg.")
             st.rerun()
         else:
-            st.warning("File sonno vuoto o non valido.")
+            st.error("Impossibile leggere il file sonno.")
 
     st.header("🏋️ 3. Attività")
     f_act = st.file_uploader("Activities.csv", type=['csv'], accept_multiple_files=True)
