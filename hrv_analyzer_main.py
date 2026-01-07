@@ -5,12 +5,20 @@ import os
 import altair as alt
 from datetime import datetime, timedelta
 
-# Import Scipy (Analisi Spettro)
+# Import Scipy e Fix per Numpy 2.0
 try:
     from scipy import interpolate, signal
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
+
+# --- FIX COMPATIBILITÀ NUMPY 2.0 ---
+# Numpy 2.0 ha rinominato 'trapz' in 'trapezoid'.
+# Creiamo una funzione 'trapz' sicura che funziona su tutte le versioni.
+try:
+    trapz = np.trapezoid
+except AttributeError:
+    trapz = np.trapz
 
 # --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(page_title="HRV Engineer Dashboard", layout="wide", page_icon="🫀")
@@ -20,7 +28,7 @@ st.markdown("### Monitoraggio Ingegneristico: Carico, Recupero & Analisi Spettra
 
 DB_FILE = 'hrv_database.csv'
 
-# --- 1. PARSING HRV (VERSIONE DEBUGGING) ---
+# --- 1. PARSING HRV (CORRETTO PER NUMPY 2.0) ---
 def parse_rr_file_advanced(file_content):
     try:
         content = file_content.decode("utf-8").splitlines()
@@ -32,12 +40,12 @@ def parse_rr_file_advanced(file_content):
                 if 300 < val < 2000: rr_intervals.append(val)
         
         if len(rr_intervals) < 30: 
-            return None # Troppo pochi dati
+            return None
         
         rr = np.array(rr_intervals)
         diffs = np.diff(rr)
         
-        # Time Domain (Questi funzionano sempre)
+        # Time Domain
         rmssd = np.sqrt(np.mean(diffs**2))
         ln_rmssd = np.log(rmssd) if rmssd > 0 else 0
         sdnn = np.std(rr, ddof=1)
@@ -48,66 +56,47 @@ def parse_rr_file_advanced(file_content):
         # Frequency Domain
         lf_power, hf_power, total_power, lf_hf = 0, 0, 0, 0
         
-        # Check Scipy
-        if not SCIPY_AVAILABLE:
-            st.error("ERRORE: Libreria Scipy non rilevata!")
-        else:
-            # TENTATIVO DI CALCOLO CON DEBUG
+        if SCIPY_AVAILABLE:
             try:
-                # 1. Asse Tempi
                 t_rr = np.cumsum(rr) / 1000.0
                 t_rr = t_rr - t_rr[0]
                 
-                # 2. Interpolazione
                 fs = 4.0 
                 steps = np.arange(0, t_rr[-1], 1/fs)
                 f_interp = interpolate.interp1d(t_rr, rr, kind='cubic', fill_value="extrapolate")
                 rr_interp = f_interp(steps)
-                
-                # 3. Detrend
                 rr_detrend = signal.detrend(rr_interp)
                 
-                # 4. Welch (Spettro)
-                # Adattiamo la finestra alla lunghezza dei dati per evitare crash su file corti
-                n_points = len(rr_detrend)
                 nperseg = 256
-                if n_points < 256:
-                    nperseg = n_points # Usa tutto se è corto
-                
-                # Controllo di sicurezza estremo
-                if nperseg <= 0: raise ValueError("Dati insufficienti dopo interpolazione")
+                if len(rr_detrend) < 256:
+                    nperseg = len(rr_detrend)
 
                 freqs, psd = signal.welch(rr_detrend, fs=fs, nperseg=nperseg)
                 
-                # 5. Integrazione
                 lf_band = (freqs >= 0.04) & (freqs < 0.15)
                 hf_band = (freqs >= 0.15) & (freqs < 0.40)
                 
-                lf_power = np.trapz(psd[lf_band], freqs[lf_band])
-                hf_power = np.trapz(psd[hf_band], freqs[hf_band])
+                # USA LA FUNZIONE SICURA 'trapz' (definita a inizio file)
+                lf_power = trapz(psd[lf_band], freqs[lf_band])
+                hf_power = trapz(psd[hf_band], freqs[hf_band])
                 
                 total_mask = (freqs >= 0.0033) & (freqs < 0.40)
-                total_power = np.trapz(psd[total_mask], freqs[total_mask])
+                total_power = trapz(psd[total_mask], freqs[total_mask])
                 
                 lf_hf = lf_power / hf_power if hf_power > 0 else 0
                 
             except Exception as e:
-                # MOSTRA L'ERRORE ESATTO A VIDEO
-                st.error(f"⚠️ Errore Calcolo Spettrale nel file: {str(e)}")
+                st.error(f"Errore Calcolo: {str(e)}")
         
         return {
-            'rMSSD': round(rmssd, 2), 
-            'ln_rMSSD': round(ln_rmssd, 2),
-            'SDNN': round(sdnn, 2), 
-            'PNN50': round(pnn50, 1),
-            'RHR': round(rhr, 1), 
-            'LF': round(lf_power, 0),
-            'HF': round(hf_power, 0), 
-            'TotalPower': round(total_power, 0),
+            'rMSSD': round(rmssd, 2), 'ln_rMSSD': round(ln_rmssd, 2),
+            'SDNN': round(sdnn, 2), 'PNN50': round(pnn50, 1),
+            'RHR': round(rhr, 1), 'LF': round(lf_power, 0),
+            'HF': round(hf_power, 0), 'TotalPower': round(total_power, 0),
             'LF_HF': round(lf_hf, 2)
         }
     except Exception as e:
-        st.error(f"Errore lettura file: {e}")
+        st.error(f"Errore lettura: {e}")
         return None
 
 # --- QUESTA È LA FUNZIONE CHE MANCAVA ---
