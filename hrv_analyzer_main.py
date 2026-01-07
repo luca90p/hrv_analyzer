@@ -294,6 +294,8 @@ def update_db_generic(new_df, merge_cols):
 
 # --- SIDEBAR ---
 with st.sidebar:
+    if not SCIPY_AVAILABLE: st.error("⚠️ Scipy non installato. Analisi LF/HF impossibile.")
+    
     st.header("📂 1. HRV")
     f_hrv = st.file_uploader("File TXT HRV", type=['txt'], accept_multiple_files=True)
     if f_hrv and st.button("Carica HRV"):
@@ -310,13 +312,6 @@ with st.sidebar:
             n, u = update_db_generic(pd.DataFrame(data), cols)
             st.success(f"HRV: {n} nuovi, {u} agg.")
             st.rerun()
-    if f_hrv:
-        if st.button("🧪 TEST RAPIDO (Leggi Valori)"):
-            for f in f_hrv:
-                # Leggi e calcola al volo senza salvare
-                res = parse_rr_file_advanced(f.getvalue())
-                st.write(f"File: {f.name}")
-                st.write("Risultati Calcolati:", res) # Qui DEVI vedere i numeri        
 
     st.header("🌙 2. Sonno")
     f_sleep = st.file_uploader("Riposo.csv", type=['csv'])
@@ -326,8 +321,6 @@ with st.sidebar:
             n, u = update_db_generic(df_s, ['Sleep', 'Feel'])
             st.success(f"Sonno: {n} nuovi, {u} agg.")
             st.rerun()
-        else:
-            st.error("Impossibile leggere il file sonno.")
 
     st.header("🏋️ 3. Attività")
     f_act = st.file_uploader("Activities.csv", type=['csv'], accept_multiple_files=True)
