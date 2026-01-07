@@ -541,7 +541,13 @@ if not df.empty:
             y=alt.Y('SDNN:Q', title='SDNN (ms)', scale=alt.Scale(zero=False)),
             tooltip=['Date', 'SDNN']
         )
-        trend_sdnn = base_sdnn.transform_regression('Date', 'SDNN', method='loess').mark_line(color='white', opacity=0.5, strokeDash=[5,5]).encode(y='SDNN:Q')
+        trend_sdnn = base_sdnn.mark_line(
+            color='white', 
+            opacity=0.5, 
+            strokeDash=[5,5]
+        ).encode(
+            y=alt.Y('SDNN_7d:Q')
+        )
         
         st.altair_chart((line_sdnn + trend_sdnn).properties(height=250), use_container_width=True)
 
