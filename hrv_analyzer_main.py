@@ -578,18 +578,31 @@ if not df.empty:
                 * *Alto (>3.0):* Stress predominante.
             """)
             
-        if 'LF' in df.columns and pd.notna(last['LF']):
+        # Controllo se esistono le colonne LF/HF nel dataframe
+        cols_exist = 'LF' in df.columns and 'HF' in df.columns
+        # Controllo se l'ultimo dato è valido (non NaN)
+        last_valid = pd.notna(last.get('LF', np.nan))
+        
+        if cols_exist and last_valid:
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Power", f"{int(last['TotalPower'])} ms²", help="Energia totale del sistema.")
-            m2.metric("LF (Stress/BP)", f"{int(last['LF'])}", delta_color="inverse") # Se sale troppo è male
-            m3.metric("HF (Recupero)", f"{int(last['HF'])}")
+            # Gestione sicura dei valori NaN/Nulli per le metriche
+            tp_val = int(last['TotalPower']) if pd.notna(last.get('TotalPower')) else 0
+            lf_val = int(last['LF']) if pd.notna(last.get('LF')) else 0
+            hf_val = int(last['HF']) if pd.notna(last.get('HF')) else 0
             
-            # --- CODICE GRAFICO CORRETTO ---
-            # Filtriamo solo le righe dove LF e HF sono > 0 per evitare errori grafici
-            valid_spectra = df_viz[(df_viz['LF'] > 0) & (df_viz['HF'] > 0)].copy()
+            m1.metric("Total Power", f"{tp_val} ms²", help="Energia totale del sistema.")
+            m2.metric("LF (Stress/BP)", f"{lf_val}", delta_color="inverse") 
+            m3.metric("HF (Recupero)", f"{hf_val}")
             
-            if not valid_spectra.empty:
-                spectra_data = valid_spectra[['Date', 'LF', 'HF']].melt('Date', var_name='Band', value_name='Power')
+            # --- MODIFICA AGGRESSIVA PER VISUALIZZARE IL GRAFICO ---
+            # Prendiamo i dati senza filtrare troppo (gli zeri si vedranno come buchi o piatti)
+            spectra_viz = df_viz[['Date', 'LF', 'HF']].copy().fillna(0)
+            
+            # Verifica se c'è almeno un dato > 0 in tutto il dataset visualizzato
+            has_data = (spectra_viz['LF'].sum() > 0) or (spectra_viz['HF'].sum() > 0)
+            
+            if has_data:
+                spectra_data = spectra_viz.melt('Date', var_name='Band', value_name='Power')
                 
                 area_spectra = alt.Chart(spectra_data).mark_area(opacity=0.6).encode(
                     x=alt.X('Date:T', axis=alt.Axis(format='%d/%m')),
@@ -607,7 +620,9 @@ if not df.empty:
                 st.altair_chart(area_spectra, use_container_width=True)
                 st.caption("🟥 Arancione: Simpatico (LF) | 🟦 Blu: Parasimpatico (HF). A riposo vorremmo vedere più Blu.")
             else:
-                st.warning("Ci sono dati HRV, ma il calcolo spettrale ha prodotto zeri. Verifica che i file .txt abbiano abbastanza battiti (>300).")
+                st.warning("Grafico vuoto: Tutte le letture LF/HF sono a zero. Prova a ricaricare i file HRV.")
+        else:
+            st.warning("Dati spettrali non disponibili (colonne mancanti o dati insufficienti).")
 
         st.divider()
 
