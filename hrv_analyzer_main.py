@@ -76,23 +76,24 @@ def parse_rr_file_advanced(file_content):
         }
     except: return None
 
+def extract_date_from_filename(filename):
+    try:
+        name_clean = os.path.splitext(filename)[0]
+        timestamp = datetime.strptime(name_clean, "%Y-%m-%d %H-%M-%S")
+        return timestamp
+    except: return None
+
 # --- 2. PARSING SONNO (CORRETTO) ---
 def parse_garmin_sleep(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
-        # Garmin esporta spesso la prima colonna con nomi strani, la rinominiamo in Date
         df.rename(columns={df.columns[0]: 'Date'}, inplace=True)
         
-        # Cerchiamo la colonna durata in modo flessibile
         col_durata = None
         for c in df.columns:
-            if 'durata' in c.lower() or 'tempo' in c.lower():
-                col_durata = c
-                break
+            if 'durata' in c.lower() or 'tempo' in c.lower(): col_durata = c; break
         
-        if not col_durata:
-            st.error("Colonna durata non trovata nel file.")
-            return pd.DataFrame()
+        if not col_durata: return pd.DataFrame()
 
         df['Date'] = pd.to_datetime(df['Date'])
         
@@ -102,7 +103,6 @@ def parse_garmin_sleep(uploaded_file):
             parts = val.split()
             if len(parts) == 2: return round(float(parts[0]) + float(parts[1])/60, 2)
             elif len(parts) == 1: 
-                # Gestione caso "7.5" o "7:30"
                 if ':' in str(val):
                     p = str(val).split(':')
                     return round(float(p[0]) + float(p[1])/60, 2)
@@ -111,23 +111,16 @@ def parse_garmin_sleep(uploaded_file):
             
         df['Sleep'] = df[col_durata].apply(clean_duration)
         
-        # Mappa qualità
-        # Cerchiamo colonna qualità
         col_qualita = 'Qualità'
         for c in df.columns: 
             if 'qualit' in c.lower(): col_qualita = c; break
 
         quality_map = {'Eccellente': 9, 'Buono': 8, 'Discreto': 6, 'Scarso': 4}
-        if col_qualita in df.columns:
-            df['Feel'] = df[col_qualita].map(quality_map).fillna(5)
-        else:
-            df['Feel'] = 5 
-            
-        # Restituisce le colonne con i nomi corretti per il DB
+        if col_qualita in df.columns: df['Feel'] = df[col_qualita].map(quality_map).fillna(5)
+        else: df['Feel'] = 5 
+        
         return df[['Date', 'Sleep', 'Feel']]
-    except Exception as e:
-        st.error(f"Errore lettura Sonno: {e}")
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 # --- 3. PARSING ATTIVITÀ (CORRETTO) ---
 def parse_garmin_activities(uploaded_file):
@@ -181,9 +174,7 @@ def parse_garmin_activities(uploaded_file):
 
         df['Load_Score'] = df.apply(calculate_load, axis=1)
         
-        # Pivot per Load
         piv = df.pivot_table(index='Date_Day', columns='Category', values='Load_Score', aggfunc='sum', fill_value=0).reset_index()
-        # Totali
         agg = df.groupby('Date_Day').agg({'Dist_km': 'sum', 'Mins': 'sum'}).reset_index()
         
         final = pd.merge(piv, agg, on='Date_Day')
@@ -234,7 +225,6 @@ def recalculate_status(df):
 
 def update_db_generic(new_df, merge_cols):
     current_db = load_db()
-    
     current_db['Date'] = pd.to_datetime(current_db['Date'])
     current_db['Date_Day'] = current_db['Date'].dt.date
     new_df['Date'] = pd.to_datetime(new_df['Date'])
@@ -257,13 +247,10 @@ def update_db_generic(new_df, merge_cols):
         else:
             idx = current_db[mask].index[0]
             for c in merge_cols:
-                # Controlla se la colonna esiste nel nuovo dato e non è nulla
                 if c in row and pd.notna(row[c]):
                     if 'Load_' in c:
-                        # Per i Load sommiamo o sovrascriviamo solo se > 0
                         if row[c] > 0: current_db.at[idx, c] = row[c]
                     else:
-                        # Per il resto (es. Sleep, Feel) sovrascriviamo
                         current_db.at[idx, c] = row[c]
             cnt_upd += 1
             
@@ -525,6 +512,9 @@ if not df.empty:
             st.markdown("""
             * **rMSSD (Il Meccanico):** Indica l'attività parasimpatica a *breve termine*. È quanto velocemente il tuo corpo riesce a "frenare" il cuore beat-to-beat. È l'indice del recupero immediato.
             * **SDNN (Il Serbatoio):** È la deviazione standard di *tutti* i battiti. Rappresenta la **capacità totale** del tuo sistema nervoso di rispondere agli stress. 
+
+[Image of Autonomic Nervous System Balance]
+
                 * *SDNN Alto:* Grande riserva di energia adattiva (Sei resiliente).
                 * *SDNN Basso cronico:* Rischio burnout o sovrallenamento strutturale.
             """)
