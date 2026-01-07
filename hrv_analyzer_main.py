@@ -20,9 +20,8 @@ st.markdown("### Monitoraggio Ingegneristico: Carico, Recupero & Analisi Spettra
 
 DB_FILE = 'hrv_database.csv'
 
-# --- 1. PARSING HRV (VERSIONE DEBUG) ---
+# --- 1. PARSING HRV ---
 def parse_rr_file_advanced(file_content):
-    # Logica base
     try:
         content = file_content.decode("utf-8").splitlines()
         rr_intervals = []
@@ -32,9 +31,7 @@ def parse_rr_file_advanced(file_content):
                 val = int(line)
                 if 300 < val < 2000: rr_intervals.append(val)
         
-        if len(rr_intervals) < 10: 
-            st.error("File HRV troppo corto (<10 battiti).")
-            return None
+        if len(rr_intervals) < 10: return None
         
         rr = np.array(rr_intervals)
         diffs = np.diff(rr)
@@ -50,16 +47,7 @@ def parse_rr_file_advanced(file_content):
         # Frequency Domain
         lf_power, hf_power, total_power, lf_hf = 0, 0, 0, 0
         
-        # DEBUG CHECK: Scipy c'è?
-        if not SCIPY_AVAILABLE:
-            st.error("ERRORE CRITICO: La libreria 'scipy' non viene rilevata dallo script.")
-        
-        # DEBUG CHECK: Abbastanza dati?
-        elif len(rr) <= 30:
-            st.warning(f"Attenzione: Pochi battiti ({len(rr)}) per analisi spettrale.")
-            
-        else:
-            # Calcolo PROTETTO con stampa errore
+        if SCIPY_AVAILABLE and len(rr) > 30:
             try:
                 t_rr = np.cumsum(rr) / 1000.0
                 t_rr = t_rr - t_rr[0]
@@ -77,10 +65,7 @@ def parse_rr_file_advanced(file_content):
                 hf_power = np.trapz(psd[hf_band], freqs[hf_band])
                 total_power = np.trapz(psd[(freqs >= 0) & (freqs < 0.4)], freqs[(freqs >= 0) & (freqs < 0.4)])
                 lf_hf = lf_power / hf_power if hf_power > 0 else 0
-                
-            except Exception as e:
-                # QUI STA IL SEGRETO: Stampa l'errore esatto!
-                st.error(f"Errore Calcolo Spettrale: {str(e)}")
+            except: pass
         
         return {
             'rMSSD': round(rmssd, 2), 'ln_rMSSD': round(ln_rmssd, 2),
@@ -89,9 +74,7 @@ def parse_rr_file_advanced(file_content):
             'HF': round(hf_power, 0), 'TotalPower': round(total_power, 0),
             'LF_HF': round(lf_hf, 2)
         }
-    except Exception as e:
-        st.error(f"Errore lettura file generale: {e}")
-        return None
+    except: return None
 
 # --- 2. PARSING SONNO (CORRETTO) ---
 def parse_garmin_sleep(uploaded_file):
