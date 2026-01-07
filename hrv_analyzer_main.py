@@ -310,6 +310,13 @@ with st.sidebar:
             n, u = update_db_generic(pd.DataFrame(data), cols)
             st.success(f"HRV: {n} nuovi, {u} agg.")
             st.rerun()
+    if f_hrv:
+        if st.button("🧪 TEST RAPIDO (Leggi Valori)"):
+            for f in f_hrv:
+                # Leggi e calcola al volo senza salvare
+                res = parse_rr_file_advanced(f.getvalue())
+                st.write(f"File: {f.name}")
+                st.write("Risultati Calcolati:", res) # Qui DEVI vedere i numeri        
 
     st.header("🌙 2. Sonno")
     f_sleep = st.file_uploader("Riposo.csv", type=['csv'])
