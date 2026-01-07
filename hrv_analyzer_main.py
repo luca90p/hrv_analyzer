@@ -20,8 +20,9 @@ st.markdown("### Monitoraggio Ingegneristico: Carico, Recupero & Analisi Spettra
 
 DB_FILE = 'hrv_database.csv'
 
-# --- 1. PARSING HRV ---
+# --- 1. PARSING HRV (VERSIONE DEBUG) ---
 def parse_rr_file_advanced(file_content):
+    # Logica base
     try:
         content = file_content.decode("utf-8").splitlines()
         rr_intervals = []
@@ -31,11 +32,14 @@ def parse_rr_file_advanced(file_content):
                 val = int(line)
                 if 300 < val < 2000: rr_intervals.append(val)
         
-        if len(rr_intervals) < 10: return None
+        if len(rr_intervals) < 10: 
+            st.error("File HRV troppo corto (<10 battiti).")
+            return None
         
         rr = np.array(rr_intervals)
         diffs = np.diff(rr)
         
+        # Time Domain
         rmssd = np.sqrt(np.mean(diffs**2))
         ln_rmssd = np.log(rmssd) if rmssd > 0 else 0
         sdnn = np.std(rr, ddof=1)
@@ -43,24 +47,40 @@ def parse_rr_file_advanced(file_content):
         rhr = 60000 / mean_rr
         pnn50 = (np.sum(np.abs(diffs) > 50) / len(diffs)) * 100
         
+        # Frequency Domain
         lf_power, hf_power, total_power, lf_hf = 0, 0, 0, 0
-        if SCIPY_AVAILABLE and len(rr) > 30:
+        
+        # DEBUG CHECK: Scipy c'è?
+        if not SCIPY_AVAILABLE:
+            st.error("ERRORE CRITICO: La libreria 'scipy' non viene rilevata dallo script.")
+        
+        # DEBUG CHECK: Abbastanza dati?
+        elif len(rr) <= 30:
+            st.warning(f"Attenzione: Pochi battiti ({len(rr)}) per analisi spettrale.")
+            
+        else:
+            # Calcolo PROTETTO con stampa errore
             try:
                 t_rr = np.cumsum(rr) / 1000.0
                 t_rr = t_rr - t_rr[0]
-                fs = 4.0
+                fs = 4.0 
                 steps = np.arange(0, t_rr[-1], 1/fs)
                 f_interp = interpolate.interp1d(t_rr, rr, kind='cubic', fill_value="extrapolate")
                 rr_interp = f_interp(steps)
                 rr_detrend = signal.detrend(rr_interp)
                 freqs, psd = signal.welch(rr_detrend, fs=fs, nperseg=min(len(rr_detrend), 256))
+                
                 lf_band = (freqs >= 0.04) & (freqs < 0.15)
                 hf_band = (freqs >= 0.15) & (freqs < 0.40)
+                
                 lf_power = np.trapz(psd[lf_band], freqs[lf_band])
                 hf_power = np.trapz(psd[hf_band], freqs[hf_band])
                 total_power = np.trapz(psd[(freqs >= 0) & (freqs < 0.4)], freqs[(freqs >= 0) & (freqs < 0.4)])
                 lf_hf = lf_power / hf_power if hf_power > 0 else 0
-            except: pass
+                
+            except Exception as e:
+                # QUI STA IL SEGRETO: Stampa l'errore esatto!
+                st.error(f"Errore Calcolo Spettrale: {str(e)}")
         
         return {
             'rMSSD': round(rmssd, 2), 'ln_rMSSD': round(ln_rmssd, 2),
@@ -69,14 +89,9 @@ def parse_rr_file_advanced(file_content):
             'HF': round(hf_power, 0), 'TotalPower': round(total_power, 0),
             'LF_HF': round(lf_hf, 2)
         }
-    except: return None
-
-def extract_date_from_filename(filename):
-    try:
-        name_clean = os.path.splitext(filename)[0]
-        timestamp = datetime.strptime(name_clean, "%Y-%m-%d %H-%M-%S")
-        return timestamp
-    except: return None
+    except Exception as e:
+        st.error(f"Errore lettura file generale: {e}")
+        return None
 
 # --- 2. PARSING SONNO (CORRETTO) ---
 def parse_garmin_sleep(uploaded_file):
