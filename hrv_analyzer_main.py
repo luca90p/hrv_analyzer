@@ -98,6 +98,16 @@ def parse_rr_file_advanced(file_content):
         }
     except: return None
 
+# --- QUESTA È LA FUNZIONE CHE MANCAVA ---
+def extract_date_from_filename(filename):
+    try:
+        # Tenta di estrarre la data dal nome file (es. "2026-01-07 08-44-22.txt")
+        name_clean = os.path.splitext(filename)[0]
+        timestamp = datetime.strptime(name_clean, "%Y-%m-%d %H-%M-%S")
+        return timestamp
+    except ValueError:
+        return None
+
 # --- 2. PARSING SONNO (CORRETTO) ---
 def parse_garmin_sleep(uploaded_file):
     try:
