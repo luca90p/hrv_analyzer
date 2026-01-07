@@ -5,7 +5,7 @@ import os
 import altair as alt
 from datetime import datetime, timedelta
 
-# Tenta l'import di scipy per l'analisi spettrale
+# Import Scipy (Analisi Spettro)
 try:
     from scipy import interpolate, signal
     SCIPY_AVAILABLE = True
