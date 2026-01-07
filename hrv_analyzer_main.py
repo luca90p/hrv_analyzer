@@ -346,6 +346,13 @@ if not df.empty:
     # 1. CALCOLI PER VISUALIZZAZIONE
     df['rMSSD_7d'] = df['rMSSD'].rolling(window=7, min_periods=1).mean()
     df['std_7d'] = df['rMSSD'].rolling(window=7, min_periods=3).std()
+
+    # NEW: SDNN Trend (Rolling) per evitare regression bug
+    if 'SDNN' in df.columns:
+        df['SDNN_7d'] = df['SDNN'].rolling(window=7, min_periods=1).mean()
+    else:
+        df['SDNN_7d'] = np.nan
+        df['SDNN'] = np.nan
     
     # Banda di Normalità (Soft Background)
     df['zone_min'] = df['rMSSD_7d'] - (0.75 * df['std_7d'])
