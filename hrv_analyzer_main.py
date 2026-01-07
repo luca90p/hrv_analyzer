@@ -342,78 +342,170 @@ df = load_db()
 
 if not df.empty:
     df = df.sort_values('Date')
+    
+    # 1. CALCOLI AVANZATI (BASELINE & ZONE)
+    # Media mobile 7 giorni (Baseline)
     df['rMSSD_7d'] = df['rMSSD'].rolling(window=7, min_periods=1).mean()
+    # Deviazione Standard mobile 7 giorni
+    df['std_7d'] = df['rMSSD'].rolling(window=7, min_periods=3).std()
+    
+    # Definizione "Normal Range" (Zona Ottimale) alla HRV4Training
+    # Solitamente è Media +/- 0.75 * Deviazione Standard
+    df['zone_min'] = df['rMSSD_7d'] - (0.75 * df['std_7d'])
+    df['zone_max'] = df['rMSSD_7d'] + (0.75 * df['std_7d'])
+    
+    # Metriche aggiuntive
     df['rMSSD_Response'] = df['rMSSD'].shift(-1)
-    df['CV_7d'] = (df['rMSSD'].rolling(window=7, min_periods=3).std() / df['rMSSD'].rolling(window=7, min_periods=3).mean()) * 100
+    df['CV_7d'] = (df['std_7d'] / df['rMSSD_7d']) * 100
     
     last = df.iloc[-1]
     
-    st.subheader(f"📊 Report: {last['Date'].strftime('%d/%m/%Y')}")
+    # --- HEADER & KPI PRO ---
+    st.subheader(f"📊 Report: {last['Date'].strftime('%d %B %Y')}")
     
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("rMSSD", f"{last['rMSSD']} ms", f"{last['rMSSD'] - last['rMSSD_7d']:.1f} vs Avg")
-    k2.metric("Load", int(last['Daily_Load']) if pd.notna(last['Daily_Load']) else "--")
-    k3.metric("Sonno", f"{last['Sleep']} h" if pd.notna(last['Sleep']) else "--")
-    k4.metric("Status", last['Status'])
+    # Status Banner "Whoop Style"
+    status_color = "green" if "GO" in last['Status'] else "orange" if "CAUTELA" in last['Status'] else "red"
+    st.markdown(f"""
+    <div style="padding: 15px; border-radius: 10px; background-color: rgba(255,255,255,0.05); border-left: 5px solid {status_color}; margin-bottom: 20px;">
+        <h2 style="margin:0; color: {status_color};">{last['Status']}</h2>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # KPI in container pulito
+    with st.container():
+        k1, k2, k3, k4 = st.columns(4)
+        
+        # Logica freccia trend
+        diff = last['rMSSD'] - last['rMSSD_7d']
+        arrow = "⬆️" if diff > 1 else "⬇️" if diff < -1 else "➡️"
+        
+        k1.metric("rMSSD (Fisiologia)", f"{int(last['rMSSD'])} ms", f"{diff:.1f} vs Baseline {arrow}")
+        k2.metric("Strain (Carico)", int(last['Daily_Load']) if pd.notna(last['Daily_Load']) else "--")
+        k3.metric("Sonno", f"{last['Sleep']} h" if pd.notna(last['Sleep']) else "--")
+        k4.metric("CV (Stabilità)", f"{last['CV_7d']:.1f}%", help="<5% Ottimo, >10% Stress/Instabile")
 
     st.divider()
 
-    c_mode, c_inf = st.columns([1, 3])
-    mode = c_mode.radio("Modo:", ["Readiness (AM)", "Response (PM->AM)"], 0)
-    if mode == "Readiness (AM)":
-        y_ax = 'rMSSD'
-        clr = 'black'
-        c_inf.info("Stamattina vs Oggi Pom.")
+    # --- CONTROLLI ---
+    c_mode, c_legend = st.columns([1, 4])
+    with c_mode:
+        view_mode = st.radio("Analisi:", ["Readiness (AM)", "Response (Effect)"], horizontal=True, label_visibility="collapsed")
+    
+    if view_mode == "Readiness (AM)":
+        y_target = 'rMSSD'
+        line_color = '#ffffff' # Bianco per readiness
+        tooltip_title = "Readiness"
     else:
-        y_ax = 'rMSSD_Response'
-        clr = '#d62728'
-        c_inf.info("Carico Oggi -> Effetto Domani")
+        y_target = 'rMSSD_Response'
+        line_color = '#ff6b6b' # Rosso chiaro per response
+        tooltip_title = "Response"
 
-    t1, t2, t3, t4 = st.tabs(["⚡ Quadro Generale", "🌙 Recupero", "📝 Dati", "🔬 Lab"])
+    # --- SUPER CHART (ALTAIR PRO) ---
+    t1, t2, t3, t4 = st.tabs(["⚡ Performance Chart", "🌙 Sleep Analysis", "📝 Data Grid", "🔬 Advanced Lab"])
     
     with t1:
-        cd = df.copy()
-        cd = cd.rename(columns={'Load_Corsa': 'Corsa', 'Load_Bici': 'Bici', 'Load_Altro': 'Altro'})
-        base = alt.Chart(cd).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title='')))
+        # Prep dati
+        chart_data = df.copy()
+        chart_data['Color_Status'] = chart_data['Status'].apply(
+            lambda x: '#44bd32' if 'GO' in x else '#fbc531' if 'CAUTELA' in x else '#e84118'
+        )
+        chart_data = chart_data.rename(columns={'Load_Corsa': 'Corsa', 'Load_Bici': 'Bici', 'Load_Altro': 'Altro'})
         
-        mlt = cd.melt(id_vars=['Date'], value_vars=['Corsa', 'Bici', 'Altro'], var_name='Sport', value_name='Load')
-        bars = alt.Chart(mlt).mark_bar().encode(
-            x='Date:T', y='Load:Q', color=alt.Color('Sport:N', scale=alt.Scale(range=['#d62728', '#1f77b4', '#7f7f7f'])),
+        # Base Chart
+        base = alt.Chart(chart_data).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title=None, grid=False)))
+
+        # 1. BANDA DI NORMALITÀ (Zona Grigia Sfondo) - "HRV4Training Style"
+        band = base.mark_area(opacity=0.2, color='#8c92ac').encode(
+            y='zone_min:Q',
+            y2='zone_max:Q'
+        )
+
+        # 2. CARICO (Barre Stacked Sottili)
+        melted_load = chart_data.melt(id_vars=['Date'], value_vars=['Corsa', 'Bici', 'Altro'], var_name='Sport', value_name='Load')
+        bars = alt.Chart(melted_load).mark_bar(opacity=0.6, width=10).encode(
+            x='Date:T',
+            y=alt.Y('Load:Q', axis=alt.Axis(title='Strain Load', grid=False, tickCount=5)),
+            color=alt.Color('Sport:N', legend=alt.Legend(orient='top', title=None), 
+                            scale=alt.Scale(range=['#e84118', '#00a8ff', '#7f8fa6'])), # Rosso Corsa, Blu Bici, Grigio Altro
             tooltip=['Date', 'Sport', 'Load']
         )
-        line = base.mark_line(color=clr, strokeWidth=3, point=True).encode(
-            y=alt.Y(f'{y_ax}:Q', scale=alt.Scale(zero=False), title='rMSSD'), tooltip=['Date', f'{y_ax}']
+
+        # 3. LINEA HRV (Sopra tutto)
+        line = base.mark_line(color=line_color, strokeWidth=2).encode(
+            y=alt.Y(f'{y_target}:Q', scale=alt.Scale(zero=False, padding=20), axis=alt.Axis(title='rMSSD (ms)', grid=True, gridOpacity=0.1))
         )
-        up = alt.layer(bars, line).resolve_scale(y='independent').properties(height=350)
+
+        # 4. PUNTI HRV COLORATI (Status del giorno) - "Whoop Style"
+        points = base.mark_circle(size=80, opacity=1).encode(
+            y=f'{y_target}:Q',
+            color=alt.Color('Color_Status:N', scale=None), # Usa il colore calcolato nel DF
+            tooltip=['Date', f'{y_target}', 'Status']
+        )
+
+        # Composizione
+        combo_chart = (bars + band + line + points).resolve_scale(y='independent').properties(height=400)
+        st.altair_chart(combo_chart, use_container_width=True)
         
-        bs = base.mark_bar(color='#2ca02c', opacity=0.5).encode(y=alt.Y('Sleep:Q', scale=alt.Scale(domain=[4, 12])), tooltip=['Date', 'Sleep'])
-        lf = base.mark_line(color='#ff7f0e', point=True).encode(y=alt.Y('Feel:Q', scale=alt.Scale(domain=[1, 10])), tooltip=['Date', 'Feel'])
-        low = alt.layer(bs, lf).resolve_scale(y='independent').properties(height=150)
-        
-        st.altair_chart(alt.vconcat(up, low).resolve_scale(x='shared'), use_container_width=True)
+        st.caption("🟦 Fascia Grigia: Tua Zona di Normalità (Baseline). ● Punti: Verde=Go, Giallo=Cautela, Rosso=Riposo.")
 
     with t2:
-        c1, c2 = st.columns(2)
-        with c1: st.bar_chart(df.set_index('Date')['Sleep'], color="#2E8B57")
-        with c2: st.line_chart(df.set_index('Date')['Feel'], color="#FFA500")
+        # GRAFICO SONNO "AREA" (Più moderno delle barre)
+        st.markdown("#### Qualità e Durata del Sonno")
+        
+        base_sleep = alt.Chart(df).encode(x=alt.X('Date:T', axis=alt.Axis(format='%d/%m', title=None)))
+        
+        # Area sfumata per il sonno
+        area_sleep = base_sleep.mark_area(
+            line={'color':'#4cd137'},
+            color=alt.Gradient(
+                gradient='linear',
+                stops=[alt.GradientStop(color='#4cd137', offset=0),
+                       alt.GradientStop(color='rgba(76, 209, 55, 0)', offset=1)],
+                x1=1, x2=1, y1=1, y2=0
+            )
+        ).encode(
+            y=alt.Y('Sleep:Q', scale=alt.Scale(domain=[4, 11]), axis=alt.Axis(title='Ore', grid=False)),
+            tooltip=['Date', 'Sleep']
+        )
+        
+        # Linea Feel
+        line_feel = base_sleep.mark_line(color='#e1b12c', strokeDash=[5,5]).encode(
+            y=alt.Y('Feel:Q', scale=alt.Scale(domain=[0, 10]), axis=alt.Axis(title='Feel')),
+            tooltip=['Date', 'Feel']
+        )
+        
+        st.altair_chart((area_sleep + line_feel).resolve_scale(y='independent').properties(height=250), use_container_width=True)
 
-    with t3: st.dataframe(df.sort_values('Date', ascending=False))
+    with t3:
+        # Dataframe con highlight
+        st.dataframe(
+            df[['Date', 'rMSSD', 'Status', 'Daily_Load', 'Sleep', 'Feel']].sort_values('Date', ascending=False),
+            use_container_width=True,
+            column_config={
+                "Date": st.column_config.DateColumn("Data", format="DD/MM/YYYY"),
+                "rMSSD": st.column_config.NumberColumn("rMSSD", format="%d ms"),
+                "Daily_Load": st.column_config.ProgressColumn("Carico", format="%d", min_value=0, max_value=500),
+            }
+        )
 
     with t4:
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("ln(rMSSD)", f"{last['ln_rMSSD']}")
-        r2.metric("PNN50", f"{last['PNN50']}%")
-        r3.metric("SDNN", f"{last['SDNN']}")
-        r4.metric("CV (7d)", f"{last['CV_7d']:.1f}%")
-        st.divider()
-        if 'LF' in df.columns and pd.notna(last['LF']):
-            f1, f2, f3, f4 = st.columns(4)
-            f1.metric("TotPower", f"{int(last['TotalPower'])}")
-            f2.metric("LF", f"{int(last['LF'])}")
-            f3.metric("HF", f"{int(last['HF'])}")
-            f4.metric("LF/HF", f"{last['LF_HF']}")
+        st.markdown("### 🔬 Laboratorio Analisi")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("ln(rMSSD)", f"{last['ln_rMSSD']}")
+        c2.metric("PNN50", f"{last['PNN50']}%")
+        c3.metric("SDNN", f"{last['SDNN']}")
+        c4.metric("LF/HF Ratio", f"{last['LF_HF']}")
         
-        cv = alt.Chart(df).mark_line(color='purple', point=True).encode(x='Date:T', y='CV_7d:Q').properties(height=250)
-        st.altair_chart(cv, use_container_width=True)
+        st.markdown("#### Coefficiente di Variazione (Instabilità)")
+        cv_chart = alt.Chart(df).mark_area(color='#9c88ff', opacity=0.3, line=True).encode(
+            x='Date:T',
+            y=alt.Y('CV_7d:Q', title='CV %'),
+            tooltip=['Date', 'CV_7d']
+        ).properties(height=200)
+        
+        threshold = alt.Chart(pd.DataFrame({'y': [10]})).mark_rule(color='red', strokeDash=[3,3]).encode(y='y')
+        
+        st.altair_chart(cv_chart + threshold, use_container_width=True)
+
 else:
-    st.info("Carica i file dalla sidebar.")
+    st.info("👋 Database vuoto. Carica i file dalla sidebar.")
