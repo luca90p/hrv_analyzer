@@ -20,7 +20,7 @@ st.markdown("### Monitoraggio Ingegneristico: Carico, Recupero & Analisi Spettra
 
 DB_FILE = 'hrv_database.csv'
 
-# --- 1. PARSING HRV ---
+# --- 1. PARSING HRV (OTTIMIZZATO PER FILE CORTI) ---
 def parse_rr_file_advanced(file_content):
     try:
         content = file_content.decode("utf-8").splitlines()
@@ -31,7 +31,8 @@ def parse_rr_file_advanced(file_content):
                 val = int(line)
                 if 300 < val < 2000: rr_intervals.append(val)
         
-        if len(rr_intervals) < 10: return None
+        # Abbassiamo la soglia minima di sicurezza
+        if len(rr_intervals) < 30: return None
         
         rr = np.array(rr_intervals)
         diffs = np.diff(rr)
@@ -47,25 +48,46 @@ def parse_rr_file_advanced(file_content):
         # Frequency Domain
         lf_power, hf_power, total_power, lf_hf = 0, 0, 0, 0
         
-        if SCIPY_AVAILABLE and len(rr) > 30:
+        if SCIPY_AVAILABLE:
             try:
+                # Creazione asse tempi in secondi
                 t_rr = np.cumsum(rr) / 1000.0
                 t_rr = t_rr - t_rr[0]
+                
+                # Interpolazione a 4Hz
                 fs = 4.0 
-                steps = np.arange(0, t_rr[-1], 1/fs)
+                duration = t_rr[-1]
+                steps = np.arange(0, duration, 1/fs)
                 f_interp = interpolate.interp1d(t_rr, rr, kind='cubic', fill_value="extrapolate")
                 rr_interp = f_interp(steps)
                 rr_detrend = signal.detrend(rr_interp)
-                freqs, psd = signal.welch(rr_detrend, fs=fs, nperseg=min(len(rr_detrend), 256))
                 
+                # Adattamento dinamico della finestra (nperseg)
+                # Se il file è corto, riduciamo la finestra per permettere il calcolo
+                data_len = len(rr_detrend)
+                nperseg = 256
+                if data_len < 256:
+                    nperseg = data_len  # Usa tutta la lunghezza disponibile
+                
+                freqs, psd = signal.welch(rr_detrend, fs=fs, nperseg=nperseg)
+                
+                # Integrazione Bande
                 lf_band = (freqs >= 0.04) & (freqs < 0.15)
                 hf_band = (freqs >= 0.15) & (freqs < 0.40)
                 
                 lf_power = np.trapz(psd[lf_band], freqs[lf_band])
                 hf_power = np.trapz(psd[hf_band], freqs[hf_band])
-                total_power = np.trapz(psd[(freqs >= 0) & (freqs < 0.4)], freqs[(freqs >= 0) & (freqs < 0.4)])
+                
+                # Calcolo Totale (0.003 - 0.4 Hz)
+                total_mask = (freqs >= 0.0033) & (freqs < 0.40)
+                total_power = np.trapz(psd[total_mask], freqs[total_mask])
+                
                 lf_hf = lf_power / hf_power if hf_power > 0 else 0
-            except: pass
+                
+            except Exception as e:
+                # Se fallisce il calcolo spettrale, stampa errore in console ma non bloccare
+                print(f"Errore Spettro: {e}")
+                pass
         
         return {
             'rMSSD': round(rmssd, 2), 'ln_rMSSD': round(ln_rmssd, 2),
@@ -74,13 +96,6 @@ def parse_rr_file_advanced(file_content):
             'HF': round(hf_power, 0), 'TotalPower': round(total_power, 0),
             'LF_HF': round(lf_hf, 2)
         }
-    except: return None
-
-def extract_date_from_filename(filename):
-    try:
-        name_clean = os.path.splitext(filename)[0]
-        timestamp = datetime.strptime(name_clean, "%Y-%m-%d %H-%M-%S")
-        return timestamp
     except: return None
 
 # --- 2. PARSING SONNO (CORRETTO) ---
